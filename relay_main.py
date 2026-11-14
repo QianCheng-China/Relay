@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Relay 1.0 Beta 主程序（壳）
+Relay 1.1 主程序（壳）
 ------------------------
 组成：relay_main.py(本文件) + assistant.py(AI问答) + resource.py(课件)
       + remoteclasswork.py(班级作业) 四 Blueprint，waitress 生产服务器。
 运行：python relay_main.py （监听 0.0.0.0:80，128 线程）
-依赖：pip install flask waitress dnslib requests markdown ziamath pymupdf pywin32 winrt
-说明：
-- v1.0 Beta (HGH)：新增 RemoteClasswork；全部闪退缓解机制统一命名为 Relay Hold
-  （hold_page / HOLD_MAP / hold_draft_* / resource hold_get/hold_save 等），
-  数据库表与列名保持不变以保证已有数据兼容。
-- v0.2.0 起移除内置自修复体系；外部 autoupdate.py / gate.py / 监护进程请自行下线。
-- 数据目录：data/common(账号+主日志) data/assistant data/resource data/remoteclasswork。
-- 旧 relay.db / relay_qa.csv / relay.log 已弃用，不再读写。
-- 认证弹窗探测兜底路由保留（/<path:rest>），拆分不影响 Captive Portal 判定。
+依赖：pip install flask waitress dnslib requests markdown ziamath pymupdf
+      （winrt 可选：扫描件/图片 OCR；pywin32 已于 Build 40 移除——Office 文档改走 LibreOffice）
+      另需安装 LibreOffice（默认路径即可，可在 Resource 管理页改路径）。
+Build 40 (v1.1 · HGH) 变更：
+- Relay Hold v2：全局"URL+滚动位置"3 秒心跳（/hold/loc），登录后 / 按 last_url
+  完整恢复（白名单校验+7 天时效）；DB 新增 accounts.last_url/last_scroll/last_loc_ts。
+- DNS 模式系统：probe（默认，仅劫持探测域名，教师机正常上网）/ hijack / pass，
+  在"通用管理"页切换（存 DB，弃用环境变量）；内置三星/安卓探测域；
+  www.msftconnecttest.com / dns.msftncsi.com 硬排除（保护 Windows 自检）。
+- /admin/dns 网络诊断页：模式/劫持列表编辑/最近查询记录/承载网络关联客户端实时状态。
+- 管理页重组：Token 数据与最近提问移入 Assistant 管理；Hold 一键维护移入通用管理。
+- v0.2.0 起移除内置自修复体系；数据目录 data/{common,assistant,resource,remoteclasswork}。
 """
-import logging, os, re, secrets, socket, sqlite3, subprocess, sys, threading, time
+import collections, logging, os, re, secrets, socket, sqlite3, subprocess, sys, threading, time
 from datetime import datetime
 from html import escape as esc
 from socketserver import ThreadingMixIn
@@ -27,9 +30,9 @@ from waitress import serve
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------- 版本（唯一管理处） ----------
-RELAY_VERSION = "1.0 Beta"
+RELAY_VERSION = "1.1"
 RELAY_CODENAME = "HGH"
-RELAY_BUILD = 37
+RELAY_BUILD = 40
 __version__ = RELAY_VERSION
 
 APP_NAME = "Relay"
@@ -55,11 +58,27 @@ DNS_PORT = int(os.environ.get("HS_DNS_PORT", "53"))
 UPSTREAM_DNS = "223.5.5.5"
 WHITELIST = {
     "open.bigmodel.cn", "time.windows.com", "ntp.aliyun.com",
-    "kv-service.wuyuan.dev",     # RemoteClasswork 作业数据（必加）
-    "openid.zero-cat.dev",       # 仅当使用 refresh_token 续期时需要
-    # "kv.houlang.cloud",        # 仅当 BaseURL 改用此实例时需要
+    "kv-service.wuyuan.dev",      # RemoteClasswork 作业数据（必保留）
+    "openid.zero-cat.dev",        # 仅 refresh_token 续期用
+    # "kv.houlang.cloud",
 }
-
+# probe 模式默认劫持列表（安卓/三星探测域；可在 /admin/dns 增删）
+DEFAULT_PROBE_HOSTS = [
+    "connectivitycheck.gstatic.com",     # Android 标准
+    "www.google.com",                    # Android 生成 204
+    "connectivitycheck.android.com",
+    "play.googleapis.com",
+    "www.gstatic.cn",                    # 三星国行 / 中国区
+    "captive.apple.com",                 # iPad 兜底
+    "connect.rom.miui.com",
+    "wifi.vivo.com.cn",
+    "conn1.oppomobile.com",
+    "connectivitycheck.platform.hicloud.com",
+]
+# 硬排除：Windows 联网自检域名，永不劫持（教师机任务栏判定依赖它）
+DNS_GUARD = {"www.msftconnecttest.com", "dns.msftncsi.com", "ipv6.msftconnecttest.com"}
+HOLD_URL_PREFIXES = ("/home", "/assistant", "/result", "/resource", "/rc")
+HOLD_URL_MAX_AGE = 7 * 24 * 3600     # last_url 超过 7 天不再强制恢复
 HTTP_PORT = int(os.environ.get("HS_HTTP_PORT", "80"))
 HTTP_THREADS = 128
 ADMIN_PASSWORD = "admin123"   # 管理密码（部署后务必修改）
@@ -77,7 +96,7 @@ def _mklog(name, path):
 
 log = _mklog("relay.main", LOG_PATH)
 
-# ---------- key.txt（Assistant 与 Resource 索引共用） ----------
+# ---------- key.txt ----------
 def _load_config():
     vals = []
     try:
@@ -97,7 +116,6 @@ def _load_config():
 AI_API_KEY, AI_MODEL, AI_API_URL = _load_config()
 
 def ai_post(session, payload, timeout):
-    """AI 请求唯一出口（日后接本地模型只改这里）。"""
     return session.post(AI_API_URL, headers={"Authorization": "Bearer " + AI_API_KEY},
                         json=payload, timeout=timeout)
 
@@ -112,8 +130,15 @@ def dbq(path, sql, args=()):
     finally:
         conn.close()
 
+def cget(key, default=""):
+    r = dbq(COMMON_DB, "SELECT value FROM settings WHERE key=?", (key,))
+    return r[0][0] if r else default
+
+def cset(key, value):
+    dbq(COMMON_DB, "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+
 def init_common_db():
-    # accounts.last_page 列沿用旧名（数据兼容）；代码层统一以 hold_page 访问
+    # accounts.last_page 沿用旧名（数据兼容）；Hold v2 新增三列
     dbq(COMMON_DB, """CREATE TABLE IF NOT EXISTS accounts(
         username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, device_id TEXT,
         bound_at TEXT, last_seen TEXT, last_query TEXT,
@@ -121,10 +146,22 @@ def init_common_db():
     dbq(COMMON_DB, """CREATE TABLE IF NOT EXISTS sessions(
         token TEXT PRIMARY KEY, username TEXT NOT NULL, device_id TEXT NOT NULL,
         created_at TEXT)""")
+    dbq(COMMON_DB, "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
     try:
         dbq(COMMON_DB, "ALTER TABLE accounts ADD COLUMN last_page TEXT DEFAULT 'home'")
     except sqlite3.OperationalError:
         pass
+    for stmt in ("ALTER TABLE accounts ADD COLUMN last_url TEXT DEFAULT ''",
+                 "ALTER TABLE accounts ADD COLUMN last_scroll INTEGER DEFAULT 0",
+                 "ALTER TABLE accounts ADD COLUMN last_loc_ts REAL DEFAULT 0"):
+        try:
+            dbq(COMMON_DB, stmt)
+        except sqlite3.OperationalError:
+            pass
+    if not dbq(COMMON_DB, "SELECT key FROM settings WHERE key='probe_hosts'"):
+        cset("probe_hosts", "\n".join(DEFAULT_PROBE_HOSTS))
+    if not dbq(COMMON_DB, "SELECT key FROM settings WHERE key='dns_mode'"):
+        cset("dns_mode", "probe")
 
 # ---------- 设备识别 ----------
 _arp_cache, _arp_lock = {}, threading.Lock()
@@ -174,7 +211,7 @@ def current_user():
     user, sdev, adev = rows[0]
     return user if (sdev == dev and adev == dev) else None
 
-# ---------- Relay Hold：功能页位置记忆（闪退后 / 直接跳回原功能） ----------
+# ---------- Relay Hold v2：功能页 + 完整 URL + 滚动位置 ----------
 HOLD_MAP = {"assistant": "/assistant", "resource": "/resource", "rc": "/rc"}
 
 def hold_page(key):
@@ -185,6 +222,70 @@ def hold_page(key):
         except Exception:
             pass
 
+def _cur_url():
+    qs = request.query_string.decode("utf-8", "ignore") if request.query_string else ""
+    return request.path + (("?" + qs) if qs else "")
+
+def hold_scroll_for(u):
+    """Hold v2：仅当当前请求 URL 与存储的 last_url 一致（闪退恢复场景）时返回保存的滚动值。"""
+    try:
+        r = dbq(COMMON_DB, "SELECT last_url, last_scroll FROM accounts WHERE username=?", (u,))
+        if r and r[0][0] and r[0][0] == _cur_url():
+            return max(0, int(r[0][1] or 0))
+    except Exception:
+        pass
+    return 0
+
+# 全局心跳 JS（ES5）：3 秒间隔 + 滚动变化即发 + pagehide 同步补发；恢复时三次尝试 scrollTo
+HOLD_LOC_JS = ("<script>(function(){"
+ "var lastU=null,lastY=-1,t=null;"
+ "function cu(){return location.pathname+location.search;}"
+ "function cy(){return window.pageYOffset||document.documentElement.scrollTop||0;}"
+ "function send(){var a=cu(),b=Math.round(cy());"
+ "if(a===lastU&&b===lastY)return;lastU=a;lastY=b;"
+ "var x=new XMLHttpRequest();x.open('POST','/hold/loc',true);"
+ "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
+ "x.send('url='+encodeURIComponent(a)+'&scroll_y='+b);}"
+ "window.addEventListener('scroll',function(){if(t)clearTimeout(t);t=setTimeout(send,300);},false);"
+ "window.addEventListener('pagehide',function(){"
+ "var x=new XMLHttpRequest();x.open('POST','/hold/loc',false);"
+ "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
+ "x.send('url='+encodeURIComponent(cu())+'&scroll_y='+Math.round(cy()));},false);"
+ "setInterval(send,3000);"
+ "var sy=__SCROLL__;"
+ "if(sy>0){var n=0;"
+ "function rs(){var v=cy();if(v>=sy-2||n>=4)return;n++;setTimeout(rs,400);}"
+ "window.scrollTo(0,sy);setTimeout(rs,400);}"
+ "})();</script>")
+
+def hold_loc_js(u):
+    """模块页面 shell 一行接入：注入全局心跳 JS；滚动恢复值由服务端决定。"""
+    try:
+        sy = hold_scroll_for(u) if u else 0
+    except Exception:
+        sy = 0
+    return HOLD_LOC_JS.replace("__SCROLL__", str(sy))
+
+@app.route("/hold/loc", methods=["POST"])
+def hold_loc():
+    u = current_user()
+    if not u:
+        return "", 204
+    url = (request.form.get("url") or "").strip()
+    try:
+        sy = int(float(request.form.get("scroll_y") or 0))
+    except (TypeError, ValueError):
+        sy = 0
+    if not url or not url.startswith(HOLD_URL_PREFIXES):
+        return "", 204
+    sy = max(0, min(200000, sy))
+    try:
+        dbq(COMMON_DB, "UPDATE accounts SET last_url=?, last_scroll=?, last_loc_ts=? WHERE username=?",
+            (url[:300], sy, time.time(), u))
+    except Exception:
+        pass
+    return "", 204
+
 # ---------- 公共 UI ----------
 STYLE = ("<meta name='viewport' content='width=device-width,initial-scale=1'>"
  "<style>body{font-family:sans-serif;max-width:640px;margin:14px auto;"
@@ -194,12 +295,13 @@ STYLE = ("<meta name='viewport' content='width=device-width,initial-scale=1'>"
  "padding:10px;margin:5px 0}"
  "label{display:block;margin:8px 0}"
  "input[type=checkbox]{width:auto;padding:0;margin:0 8px 0 0;vertical-align:middle}"
+ "input[type=radio]{width:auto;padding:0;margin:0 8px 0 0;vertical-align:middle}"
  "button{background:#2b6cb0;color:#fff;border:0;border-radius:6px;padding:12px}"
  "button.mini{width:auto;padding:4px 8px;margin:0;font-size:13px;background:#888}"
  "a.btn2{display:block;background:#e2e8f0;color:#2d3748;border-radius:6px;"
  "padding:12px;margin:5px 0;text-align:center;text-decoration:none;font-size:17px}"
  "pre{white-space:pre-wrap;word-wrap:break-word;background:#f4f6f8;"
- "padding:10px;border-radius:6px}"
+ "padding:10px;border-radius:6px;font-size:12px}"
  ".err{color:#c0392b}.tip{color:#666;font-size:14px}"
  ".queue{background:#eef4fb;border-radius:6px;padding:6px 10px;"
  "font-size:14px;color:#2b6cb0}"
@@ -299,10 +401,21 @@ def root():
     if not u:
         return login_page()
     try:
-        r = dbq(COMMON_DB, "SELECT last_page FROM accounts WHERE username=?", (u,))
-        lp = r[0][0] if r and r[0][0] else "home"
+        r = dbq(COMMON_DB, "SELECT last_page, last_url, last_loc_ts FROM accounts WHERE username=?", (u,))
     except Exception:
-        lp = "home"
+        r = []
+    lp, last_url, last_ts = "home", "", 0.0
+    if r:
+        lp = r[0][0] or "home"
+        last_url = r[0][1] or ""
+        try:
+            last_ts = float(r[0][2] or 0)
+        except (TypeError, ValueError):
+            last_ts = 0.0
+    # Hold v2：完整 URL 恢复（前缀白名单 + 时效校验）
+    if (last_url and last_url.startswith(HOLD_URL_PREFIXES)
+            and time.time() - last_ts < HOLD_URL_MAX_AGE):
+        return redirect(last_url)
     return redirect(HOLD_MAP.get(lp, "/home"))
 
 @app.route("/home")
@@ -320,7 +433,8 @@ def home():
             "<span>查看并编辑班级作业（与班级大屏实时同步）</span></a>"
             + REOPEN_TIP + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}"
-            f"<title>{APP_NAME}</title></head><body><h3>{APP_NAME} · 功能列表</h3>{body}</body></html>")
+            f"<title>{APP_NAME}</title></head><body><h3>{APP_NAME} · 功能列表</h3>{body}"
+            + hold_loc_js(u) + "</body></html>")
 
 @app.route("/health")
 def health():
@@ -406,13 +520,15 @@ def admin():
         return admin_login_page()
     body = ("<p>选择管理模块：</p>"
             "<a class='card' href='/admin/common'><b>通用管理</b>"
-            "<span>用户账号：添加 / 批量导入 / 重置 / 解绑 / 删除 / Token 统计</span></a>"
+            "<span>账号管理 · DNS 劫持模式 · Relay Hold 一键维护</span></a>"
+            "<a class='card' href='/admin/dns'><b>网络诊断</b>"
+            "<span>劫持列表 · 最近查询 · 承载网络关联客户端实时状态</span></a>"
             "<a class='card' href='/admin/assistant'><b>Assistant 管理</b>"
-            "<span>询问记录 · Token 用量 · 联网搜索 · 对话上下文</span></a>"
+            "<span>账号数据/Token · 询问记录 · 联网搜索 · 上下文 · 公式渲染自检</span></a>"
             "<a class='card' href='/admin/resource'><b>Resource 管理</b>"
-            "<span>课件文件夹 · 学科 · 索引计划 · 手动扫描 / 重建 / 预热</span></a>"
+            "<span>课件文件夹 · LibreOffice 路径 · 索引计划 · 手动扫描 / 重建 / 预热</span></a>"
             "<a class='card' href='/admin/remoteclasswork'><b>RemoteClasswork 管理</b>"
-            "<span>KV 连接（令牌 / 鉴权双模式）· 学科权限 · 缓存与 Hold 维护</span></a>"
+            "<span>KV 连接（令牌 / 鉴权双模式）· 学科权限 · 离线队列 · Hold 维护</span></a>"
             "<p class='tip'><a href='/'>打开门户首页</a> <a href='/admin'>刷新</a></p>" + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}<title>管理</title>"
             f"</head><body><h3>{APP_NAME} · 管理中心</h3>{body}</body></html>")
@@ -461,36 +577,55 @@ def admin_common():
             dbq(COMMON_DB, "DELETE FROM accounts WHERE username=?", (u,))
             dbq(COMMON_DB, "DELETE FROM sessions WHERE username=?", (u,))
             msg = "已删除 " + u
-        elif act == "zerotok":
-            u = request.form.get("u", "").strip()
-            dbq(COMMON_DB, "UPDATE accounts SET tokens_total=0 WHERE username=?", (u,))
-            msg = "已清零 %s 的 Token 统计" % u
-        elif act == "zerotok_all":
-            dbq(COMMON_DB, "UPDATE accounts SET tokens_total=0")
-            msg = "已清零全部 Token 统计"
+        elif act == "setdns":
+            m = request.form.get("mode", "probe")
+            if m not in ("probe", "hijack", "pass"):
+                m = "probe"
+            cset("dns_mode", m)
+            _dns_mode_cache[1] = 0.0
+            msg = "DNS 劫持模式已切换为 " + m + "（即时生效）"
+        elif act == "clearhold_all":
+            try:
+                _ast_mod.hold_draft_clear_all()
+                dbq(_ast_mod.AST_DB, "DELETE FROM jobs")
+            except Exception:
+                pass
+            try:
+                dbq(_rc_mod.RC_DB, "DELETE FROM holds")
+                dbq(_rc_mod.RC_DB, "DELETE FROM drafts")
+            except Exception:
+                pass
+            try:
+                dbq(_res_mod.RES_DB, "DELETE FROM progress")
+            except Exception:
+                pass
+            dbq(COMMON_DB, "UPDATE accounts SET last_url='', last_scroll=0, "
+                           "last_loc_ts=0, last_page='home'")
+            msg = "已清空全部 Relay Hold 数据（草稿/页面位置/滚动位置），用户下次进入为全新状态"
     except Exception as e:
         msg = "操作失败：%s" % e
-    rows = dbq(COMMON_DB, "SELECT username, device_id, bound_at, last_seen, last_query, tokens_total "
+    rows = dbq(COMMON_DB, "SELECT username, device_id, bound_at, last_seen "
                           "FROM accounts ORDER BY username")
     trs = ""
     for r in rows:
         dev = (r[1] or "未绑定")[:17]
-        tok = int(r[5] or 0)
         trs += (f"<tr><td>{esc(r[0])}</td><td>{esc(dev)}</td><td>{esc(r[2] or '')}</td>"
-                f"<td>{esc(r[3] or '')}</td><td class='tip'>{esc(r[4] or '')}</td><td>{tok:,}</td><td>"
+                f"<td>{esc(r[3] or '')}</td><td>"
                 f"<form method='post' action='/admin/common' style='display:inline'>"
                 f"<input type='hidden' name='act' value='unbind'><input type='hidden' name='u' value='{esc(r[0])}'>"
                 f"<button class='mini'>解绑</button></form> "
                 f"<form method='post' action='/admin/common' style='display:inline'>"
                 f"<input type='hidden' name='act' value='del'><input type='hidden' name='u' value='{esc(r[0])}'>"
-                f"<button class='mini'>删除</button></form> "
-                f"<form method='post' action='/admin/common' style='display:inline'>"
-                f"<input type='hidden' name='act' value='zerotok'><input type='hidden' name='u' value='{esc(r[0])}'>"
-                f"<button class='mini'>Token清零</button></form></td></tr>")
+                f"<button class='mini'>删除</button></form></td></tr>")
     head = back_btn("/admin") + (("<p class='err'>" + esc(msg) + "</p>") if msg else "")
-    body = (head + "<p>AI 联网搜索等 Assistant 选项请前往 Assistant 管理；账号 Token 用量统计亦在其页查看。</p>"
+    mode = cget("dns_mode", "probe")
+    def _ck(v):
+        return " checked" if mode == v else ""
+    body = (head
+            + "<p>账号 Token 用量与最近提问数据已移至 <a href='/admin/assistant'>Assistant 管理</a>；"
+            "网络诊断见 <a href='/admin/dns'>网络诊断页</a>。</p>"
             "<table border='1'><tr><th>账号</th><th>绑定设备</th><th>绑定时间</th><th>最后活跃</th>"
-            "<th>最近提问</th><th>累计tokens</th><th>操作</th></tr>" + trs + "</table>"
+            "<th>操作</th></tr>" + trs + "</table>"
             "<h4>添加账号</h4><form method='post' action='/admin/common'>"
             "<input type='hidden' name='act' value='add'>"
             "<input name='u' placeholder='账号' style='width:45%'>"
@@ -505,11 +640,59 @@ def admin_common():
             "<input name='u' placeholder='账号' style='width:45%'>"
             "<input name='p' placeholder='新密码' style='width:45%'>"
             "<button type='submit'>重置</button></form>"
+            "<h4>DNS 劫持模式</h4>"
+            "<form method='post' action='/admin/common'>"
+            "<input type='hidden' name='act' value='setdns'>"
+            "<label><input type='radio' name='mode' value='probe'" + _ck("probe") + ">"
+            "probe（推荐：仅劫持探测域名，教师机正常上网，平板连网弹出认证）</label>"
+            "<label><input type='radio' name='mode' value='hijack'" + _ck("hijack") + ">"
+            "hijack（全量劫持：所有域名指向门户）</label>"
+            "<label><input type='radio' name='mode' value='pass'" + _ck("pass") + ">"
+            "pass（全放行，排障用）</label>"
+            "<button type='submit'>保存模式</button></form>"
+            "<p class='tip'>探测域名列表与最近查询请见 <a href='/admin/dns'>网络诊断页</a>"
+            "（平板不弹认证页时，用它找出自家 ROM 的探测域名并加入列表）</p>"
+            "<h4>Relay Hold 维护</h4>"
+            "<form method='post' action='/admin/common'>"
+            "<input type='hidden' name='act' value='clearhold_all'>"
+            "<button class='mini'>清空全部 Hold 数据（草稿/页面位置/滚动位置）</button></form>"
+            "<p class='tip'>用于个别学生端 Hold 状态异常时的远程复位，影响所有用户</p>"
             "<p class='tip'><a href='/admin'>返回管理中心</a></p>" + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}<title>通用管理</title>"
             f"</head><body><h3>{APP_NAME} · 通用管理</h3>{body}</body></html>")
 
-# ---------- DNS 劫持（原逻辑原样保留） ----------
+# ---------- DNS 模式系统 ----------
+_dns_mode_cache = ["probe", 0.0]
+_hosts_cache = [None, 0.0]
+_dns_recent = collections.deque(maxlen=300)
+_dns_recent_lock = threading.Lock()
+
+def get_dns_mode():
+    if time.time() - _dns_mode_cache[1] > 5:
+        _dns_mode_cache[0] = cget("dns_mode", "probe") or "probe"
+        _dns_mode_cache[1] = time.time()
+    return _dns_mode_cache[0]
+
+def get_hijack_hosts():
+    if time.time() - _hosts_cache[1] > 5:
+        raw = cget("probe_hosts", "") or ""
+        _hosts_cache[0] = [h.strip().lower() for h in raw.splitlines() if h.strip()]
+        _hosts_cache[1] = time.time()
+    return _hosts_cache[0] or []
+
+def _recent_add(name, hij):
+    try:
+        with _dns_recent_lock:
+            _dns_recent.append((time.time(), name, hij))
+    except Exception:
+        pass
+
+def _fwd(request):
+    try:
+        return DNSRecord.parse(_upstream(request.pack()))
+    except Exception:
+        return request.reply()
+
 def _pick(cls):
     if issubclass(cls, ThreadingMixIn):
         return cls
@@ -526,16 +709,28 @@ def _upstream(data):
 
 class Resolver(BaseResolver):
     def resolve(self, request, handler):
-        name = str(request.q.qname).lower().rstrip(".")
-        if name in WHITELIST:
-            try:
-                return DNSRecord.parse(_upstream(request.pack()))
-            except Exception:
-                return request.reply()
-        reply = request.reply()
-        if request.q.qtype == QTYPE.A:
-            reply.add_answer(RR(request.q.qname, QTYPE.A, rdata=A(PORTAL_IP), ttl=10))
-        return reply
+        try:
+            name = str(request.q.qname).lower().rstrip(".")
+            if name in DNS_GUARD:          # Windows 自检域名：永不劫持
+                return _fwd(request)
+            if name in WHITELIST:
+                return _fwd(request)
+            mode = get_dns_mode()
+            if mode == "pass":
+                return _fwd(request)
+            hij = True
+            if mode == "probe":
+                hosts = get_hijack_hosts()
+                hij = any(name == h or name.endswith("." + h) for h in hosts)
+            _recent_add(name, hij)
+            if not hij:
+                return _fwd(request)
+            reply = request.reply()
+            if request.q.qtype == QTYPE.A:
+                reply.add_answer(RR(request.q.qname, QTYPE.A, rdata=A(PORTAL_IP), ttl=10))
+            return reply
+        except Exception:
+            return request.reply()
 
 def start_dns():
     quiet = DNSLogger("-request,-reply,-truncated")
@@ -551,6 +746,117 @@ def start_dns():
         log.info("DNS(TCP) %s:%d 已启动", DNS_BIND, DNS_PORT)
     except Exception as e:
         log.error("DNS(TCP) 启动失败：%s", e)
+
+# ---------- 网络诊断页 ----------
+def _hosted_status():
+    """承载网络实时状态（netsh 输出本地化，但 MAC 地址正则跨语言）。"""
+    out = ""
+    macs = []
+    try:
+        out = subprocess.run(["netsh", "wlan", "show", "hostednetwork"],
+                             capture_output=True, text=True, timeout=8,
+                             creationflags=_NO_WINDOW).stdout or ""
+        seen = []
+        for m in re.findall(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", out):
+            mm = m if isinstance(m, str) else m.group(0)
+        # findall with group returns full match strings here (no groups captured beyond), normalize:
+        macs = []
+        for tok in re.findall(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", out):
+            t = tok.lower()
+            if t not in seen:
+                seen.append(t)
+        macs = seen
+    except Exception as e:
+        out = "获取失败：%s" % e
+    return macs, out
+
+@app.route("/admin/dns", methods=["GET", "POST"])
+def admin_dns():
+    if not admin_ok():
+        return admin_login_page()
+    msg = ""
+    act = request.form.get("act")
+    try:
+        if act == "setmode":
+            m = request.form.get("mode", "probe")
+            if m in ("probe", "hijack", "pass"):
+                cset("dns_mode", m)
+                _dns_mode_cache[1] = 0.0
+                msg = "模式已切换为 " + m
+        elif act == "addhost":
+            h = request.form.get("host", "").strip().lower()
+            if h and "." in h and h not in DNS_GUARD:
+                hosts = get_hijack_hosts()
+                if h not in hosts:
+                    hosts.append(h)
+                    cset("probe_hosts", "\n".join(hosts))
+                    _hosts_cache[1] = 0.0
+                    msg = "已加入劫持列表：" + h
+                else:
+                    msg = "已在列表中"
+            elif h in DNS_GUARD:
+                msg = "该域名受保护（Windows 自检），不可劫持"
+        elif act == "delhost":
+            h = request.form.get("host", "").strip().lower()
+            hosts = [x for x in get_hijack_hosts() if x != h]
+            cset("probe_hosts", "\n".join(hosts))
+            _hosts_cache[1] = 0.0
+            msg = "已移除：" + h
+        elif act == "resethosts":
+            cset("probe_hosts", "\n".join(DEFAULT_PROBE_HOSTS))
+            _hosts_cache[1] = 0.0
+            msg = "已恢复默认探测域名列表"
+    except Exception as e:
+        msg = "操作失败：%s" % e
+    mode = get_dns_mode()
+    hosts = get_hijack_hosts()
+    hrows = ""
+    for h in hosts:
+        hrows += ("<tr><td>%s</td><td><form method='post' action='/admin/dns' style='display:inline'>"
+                  "<input type='hidden' name='act' value='delhost'>"
+                  "<input type='hidden' name='host' value='%s'>"
+                  "<button class='mini'>移除</button></form></td></tr>" % (esc(h), esc(h)))
+    with _dns_recent_lock:
+        rec = list(_dns_recent)
+    rrows = ""
+    for ts, name, hij in reversed(rec[-60:]):
+        try:
+            t = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        except Exception:
+            t = "?"
+        rrows += ("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
+                  % (t, esc(name), "<span style='color:#c0392b'>是</span>" if hij else "否"))
+    macs, raw = _hosted_status()
+    def _ck(v):
+        return " checked" if mode == v else ""
+    body = (back_btn("/admin") + ("<p class='err'>" + esc(msg) + "</p>" if msg else "")
+            + "<h4>当前模式：" + esc(mode) + "（probe=仅探测域名 / hijack=全量 / pass=放行）</h4>"
+            "<form method='post' action='/admin/dns'>"
+            "<input type='hidden' name='act' value='setmode'>"
+            "<label><input type='radio' name='mode' value='probe'" + _ck("probe") + ">probe</label>"
+            "<label><input type='radio' name='mode' value='hijack'" + _ck("hijack") + ">hijack</label>"
+            "<label><input type='radio' name='mode' value='pass'" + _ck("pass") + ">pass</label>"
+            "<button type='submit'>切换模式</button></form>"
+            "<p class='tip'>受保护域名（永不劫持）：" + esc("、".join(sorted(DNS_GUARD))) + "</p>"
+            "<h4>劫持/探测域名列表</h4>"
+            "<table border='1'>" + (hrows or "<tr><td class='tip'>空</td></tr>") + "</table>"
+            "<form method='post' action='/admin/dns' style='display:flex;gap:6px'>"
+            "<input type='hidden' name='act' value='addhost'>"
+            "<input name='host' placeholder='新增域名，如 connectivitycheck.gstatic.com'>"
+            "<button type='submit' style='width:auto;padding:10px 16px'>加入</button></form>"
+            "<form method='post' action='/admin/dns'>"
+            "<input type='hidden' name='act' value='resethosts'>"
+            "<button class='mini'>恢复默认列表</button></form>"
+            "<h4>最近 DNS 查询（最近 60 条，劫持=是 的域名即门户触发源）</h4>"
+            "<table border='1'><tr><th>时间</th><th>域名</th><th>劫持</th></tr>"
+            + (rrows or "<tr><td colspan='3' class='tip'>暂无记录</td></tr>") + "</table>"
+            "<p class='tip'>平板不弹认证页时：让其连上热点，观察此处是否有新域名被查询但未劫持，"
+            "将其加入上方列表即可</p>"
+            "<h4>承载网络实时状态（关联客户端 MAC %d 个，含 BSSID）</h4>"
+            "<pre>" + esc(raw) + "</pre>"
+            + "<p class='tip'><a href='/admin'>返回管理中心</a></p>" + FOOTER)
+    return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}<title>网络诊断</title>"
+            f"</head><body><h3>{APP_NAME} · 网络诊断</h3>{body}</body></html>")
 
 # ===== 挂载子模块（init 注入依赖，避免循环导入） =====
 import assistant as _ast_mod
@@ -598,7 +904,10 @@ if __name__ == "__main__":
         _res_mod.start_background()
         log.info("Relay %s · %s · Build %d 门户 http://0.0.0.0:%d （waitress 线程 %d）—— Developer %s",
                  RELAY_VERSION, RELAY_CODENAME, RELAY_BUILD, HTTP_PORT, HTTP_THREADS, DEVELOPER)
-        log.info("管理 http://127.0.0.1:%d/admin · 模块 assistant/resource/remoteclasswork 已挂载 · DNS %s:%d",
+        log.info("DNS 劫持模式：%s（probe=仅探测域名劫持，教师机可正常上网；hijack=全量劫持旧行为；pass=全放行）",
+                 get_dns_mode())
+        log.info("管理 http://127.0.0.1:%d/admin · 网络诊断 /admin/dns · "
+                 "模块 assistant/resource/remoteclasswork 已挂载 · DNS %s:%d",
                  HTTP_PORT, DNS_BIND, DNS_PORT)
         serve(app, host="0.0.0.0", port=HTTP_PORT, threads=HTTP_THREADS)
     except Exception:

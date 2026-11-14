@@ -6,14 +6,15 @@ Relay RemoteClasswork 模块（班级作业查看与编辑，基于 Classworks K
 键格式：classworks-data-YYYYMMDD = {"homework":{"学科":{"content":"..."}}, "attendance":{...}}
 安全边界：仅读写当天键的 homework[学科].content；attendance 与 classworks-list-* 一律不碰；
           写回 = GET 旧值 -> 合并 -> 整键 POST（上游为覆盖式写）。
-认证双模式（互为备份，管理页切换；"直接令牌"非空时令牌模式优先）：
+认证双模式（互为备份；"直接令牌"非空时令牌模式优先）：
   - 鉴权模式：namespace + password + appId -> POST /apps/auth/token 换 JWT（自动续期）
-  - 令牌模式：直接粘贴现成 Bearer token（可选 refresh_token 尽力续期，仅对 OAuth 账号令牌有效）
-Relay Hold：功能页 + 滚动位置 + 编辑态 + 未提交草稿，闪退重开立即恢复。
-v1.0 Beta 修复：_save_ts/_save_lock 上移并启用原子节流；无权限学科只读展开；
-      _EDIT_JS 学科名 URL 编码；首屏 quick 拉取 + 防并发重复拉取；
-      修复 f-string 表达式内反斜杠嵌套引号（Python<3.12 语法错误）。
-注意：本文件必须命名为 remoteclasswork.py（与 relay_main.py 的 import 一致）。
+  - 令牌模式：直接粘贴现成 Bearer token（可选 refresh_token 尽力续期）
+Build 40 (v1.1) 变更：
+- 离线同步队列（问题7）：Classworks 不可达时保存内容入 pending_ops（同学科覆盖），
+  用户端提示"已暂存，恢复后自动同步"；后台 60s 同步线程（令牌死亡静默等待），
+  恢复后一次性合并全部待同步学科写回。
+- Relay Hold v2：滚动位置交由主程序全局心跳（删除自有 /rc/hold，避免双写冲突）；
+  编辑草稿 0.8s 防抖保留；编辑态经 URL（?edit=）随全局心跳恢复。
 """
 import base64, json, os, threading, time
 from datetime import datetime
@@ -28,10 +29,13 @@ REFRESH_URL = "https://openid.zero-cat.dev/api/accounts/refresh"  # 尽力尝试
 FORCE_REFRESH_MIN = 10     # 手动强制刷新最小间隔（秒）
 FETCH_TTL = 30             # 缓存有效期（秒）
 SAVE_GAP = 5               # 同一用户同一学科两次保存最小间隔（秒）
+SYNC_INTERVAL = 60         # 离线队列同步探测间隔（秒）
+QUEUE_MAX_TRIES = 50       # 单学科重试上限（超过丢弃并记日志）
 
-# 保存节流状态（必须在 rc_save 之前定义；锁保护原子"检查-设置"）
+# 保存节流状态（锁保护原子"检查-设置"）
 _save_ts = {}
 _save_lock = threading.Lock()
+_sync_started = False
 
 class KVError(RuntimeError):
     pass
@@ -40,7 +44,7 @@ class TokenDead(KVError):
     pass
 
 def init(m):
-    global M, RC_DB, RC_LOG, CACHE_PATH, log
+    global M, RC_DB, RC_LOG, CACHE_PATH, log, _sync_started
     M = m
     RC_DB = os.path.join(M.DIR_RC, "rc.db")
     RC_LOG = os.path.join(M.DIR_RC, "rc.log")
@@ -54,6 +58,9 @@ def init(m):
     _sdefault("rc_token", "")
     _sdefault("refresh_token", "")
     _load_cache()
+    if not _sync_started:
+        _sync_started = True
+        threading.Thread(target=_sync_loop, daemon=True).start()
 
 bp = Blueprint("rc", __name__)
 
@@ -65,6 +72,9 @@ def init_db():
         user TEXT PRIMARY KEY, scroll_y INTEGER DEFAULT 0, edit_subject TEXT DEFAULT '')""")
     M.dbq(RC_DB, """CREATE TABLE IF NOT EXISTS drafts(
         user TEXT PRIMARY KEY, subject TEXT DEFAULT '', content TEXT DEFAULT '', ts REAL DEFAULT 0)""")
+    M.dbq(RC_DB, """CREATE TABLE IF NOT EXISTS pending_ops(
+        subject TEXT PRIMARY KEY, content TEXT NOT NULL, ts REAL NOT NULL,
+        tries INTEGER DEFAULT 0, last_err TEXT DEFAULT '')""")
 
 def sget(k, d=""):
     r = M.dbq(RC_DB, "SELECT value FROM settings WHERE key=?", (k,))
@@ -185,7 +195,7 @@ def kv_request(method, path, data=None, timeout=25, _tries=2):
         return r
     raise KVError("请求重试后仍失败（HTTP %s）" % getattr(r, "status_code", "?"))
 
-# ---------------- 数据缓存（cache.json 持久化，服务重启不丢） ----------------
+# ---------------- 数据缓存（cache.json 持久化） ----------------
 CACHE = {"ts": 0.0, "date": "", "data": None, "err": ""}
 _cache_lock = threading.Lock()
 _fetch_lock = threading.Lock()
@@ -221,7 +231,6 @@ def _register_subjects(names):
                 pass
 
 def fetch_today(force=False, quick=False):
-    """拉取当天作业。quick=True：短超时少重试（首屏同步路径用）；force=True：绕过 TTL。"""
     today = _today()
     with _cache_lock:
         fresh = (CACHE["data"] is not None and CACHE["date"] == today
@@ -229,7 +238,6 @@ def fetch_today(force=False, quick=False):
     if fresh and not force:
         with _cache_lock:
             return dict(CACHE), CACHE.get("err") or ""
-    # 防并发重复拉取：非强制请求拿不到锁直接回缓存；强制请求最多等 15s
     if not _fetch_lock.acquire(timeout=15 if force else 0.2):
         with _cache_lock:
             return dict(CACHE), CACHE.get("err") or ""
@@ -262,7 +270,7 @@ def ensure_fresh():
         empty = CACHE["data"] is None
         stale = CACHE["date"] != _today() or time.time() - CACHE["ts"] >= FETCH_TTL
     if empty:
-        fetch_today(quick=True)   # 首次同步快速拉取（保证首屏有内容，最坏 ~20s）
+        fetch_today(quick=True)
     elif stale:
         threading.Thread(target=fetch_today, daemon=True).start()
 
@@ -283,17 +291,15 @@ def has_perm(u, subject):
     lst = perm_list(subject)
     return ("*" in lst) or (u in lst)
 
-# ---------------- Relay Hold：滚动 / 编辑态 / 草稿 ----------------
+# ---------------- Relay Hold：编辑态 / 草稿（滚动已由主程序全局心跳接管） ----------------
 def hold_get(u):
     r = M.dbq(RC_DB, "SELECT scroll_y, edit_subject FROM holds WHERE user=?", (u,))
     if r:
         return {"scroll": int(r[0][0] or 0), "edit": r[0][1] or ""}
     return {"scroll": 0, "edit": ""}
 
-def hold_set(u, scroll=None, edit=None):
+def hold_set(u, edit=None):
     cur = hold_get(u)
-    if scroll is not None:
-        cur["scroll"] = max(0, min(200000, int(scroll)))
     if edit is not None:
         cur["edit"] = edit
     M.dbq(RC_DB, "INSERT OR REPLACE INTO holds VALUES(?,?,?)", (u, cur["scroll"], cur["edit"]))
@@ -332,7 +338,7 @@ def save_subject(subject, content):
         else:
             return False, "读取原作业失败（HTTP %d）" % r.status_code
         hw = dict(data.get("homework") or {})
-        entry = dict(hw.get(subject) or {})   # 保留该学科除 content 外的其他字段
+        entry = dict(hw.get(subject) or {})
         entry["content"] = content
         hw[subject] = entry
         data["homework"] = hw                  # attendance 原样保留
@@ -350,6 +356,82 @@ def save_subject(subject, content):
     except Exception as e:
         return False, "保存失败：" + str(e)[:150]
 
+# ---------------- 离线同步队列（问题7） ----------------
+def _queue_op(subject, content):
+    try:
+        M.dbq(RC_DB, "INSERT OR REPLACE INTO pending_ops(subject,content,ts,tries,last_err) "
+                     "VALUES(?,?,?,0,'等待同步')", (subject, content[:20000], time.time()))
+        log.info("离线入队 subject=%s（Classworks 暂不可达）", subject)
+    except Exception as e:
+        log.warning("离线入队失败 subject=%s err=%s", subject, e)
+
+def pending_count():
+    try:
+        return int(M.dbq(RC_DB, "SELECT COUNT(*) FROM pending_ops")[0][0])
+    except Exception:
+        return 0
+
+def _sync_once():
+    """队列非空且连通时：GET 当日键 -> 合并全部待同步学科 -> 一次 POST 写回。"""
+    n = pending_count()
+    if not n:
+        return
+    key = "/kv/classworks-data-" + _today()
+    try:
+        r = kv_request("GET", key, timeout=10, _tries=0)
+    except TokenDead:
+        return          # 令牌死亡：静默等待教师更新，不刷日志
+    except Exception:
+        return          # 网络不可达：静默等待
+    if r.status_code == 200:
+        data = r.json() or {}
+    elif r.status_code == 404:
+        data = {"homework": {}, "attendance": {}}
+    else:
+        return
+    hw = dict(data.get("homework") or {})
+    ops = M.dbq(RC_DB, "SELECT subject, content FROM pending_ops ORDER BY ts")
+    for subj, content in ops:
+        entry = dict(hw.get(subj) or {})
+        entry["content"] = content
+        hw[subj] = entry
+    data["homework"] = hw                  # attendance 原样保留
+    try:
+        pr = kv_request("POST", key, data)
+    except Exception as e:
+        M.dbq(RC_DB, "UPDATE pending_ops SET tries=tries+1, last_err=? WHERE 1=1", (str(e)[:120],))
+        _drop_dead_ops()
+        return
+    if pr.status_code in (200, 201):
+        M.dbq(RC_DB, "DELETE FROM pending_ops")
+        with _cache_lock:
+            CACHE.update({"ts": time.time(), "date": _today(), "data": data, "err": ""})
+            _persist_cache()
+        _register_subjects(list(hw.keys()))
+        log.info("离线队列同步完成（%d 科，attendance 原样保留）", len(ops))
+    else:
+        M.dbq(RC_DB, "UPDATE pending_ops SET tries=tries+1, last_err=? WHERE 1=1",
+              ("HTTP %d" % pr.status_code,))
+        _drop_dead_ops()
+
+def _drop_dead_ops():
+    try:
+        dead = [r[0] for r in M.dbq(RC_DB, "SELECT subject FROM pending_ops WHERE tries>=?",
+                                    (QUEUE_MAX_TRIES,))]
+        for s in dead:
+            M.dbq(RC_DB, "DELETE FROM pending_ops WHERE subject=?", (s,))
+            log.warning("离线队列放弃 subject=%s（重试超限）", s)
+    except Exception:
+        pass
+
+def _sync_loop():
+    while True:
+        time.sleep(SYNC_INTERVAL)
+        try:
+            _sync_once()
+        except Exception:
+            log.exception("sync loop")
+
 # ---------------- 连接测试 ----------------
 def test_connection():
     out = []
@@ -361,7 +443,7 @@ def test_connection():
         if exp:
             rem = exp - time.time()
             if rem <= 0:
-                out.append("⚠ 令牌已过期（KV 读写将失败）")
+                out.append("⚠ 令牌已过期（KV 读写将失败；离线队列将继续暂存）")
             else:
                 out.append("获取令牌：成功（剩余 %.1f 天）" % (rem / 86400))
         else:
@@ -410,18 +492,7 @@ RC_STYLE = ("<style>"
  "word-wrap:break-word;max-height:60vh;overflow-y:auto}"
  "</style>")
 
-# Relay Hold JS-1：滚动位置上报/恢复（ES5 + XHR，500ms 节流）
-_SCROLL_JS = ("<script>(function(){"
- "var y=__Y__,t=null;"
- "function ry(){return window.pageYOffset||document.documentElement.scrollTop||0;}"
- "function rp(){var x=new XMLHttpRequest();x.open('POST','/rc/hold',true);"
- "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
- "x.send('scroll_y='+ry());}"
- "window.scrollTo(0,y);"
- "window.addEventListener('scroll',function(){if(t)clearTimeout(t);t=setTimeout(rp,500);},false);"
- "window.addEventListener('pagehide',rp);})();</script>")
-
-# Relay Hold JS-2：编辑草稿上报（0.8s 防抖；submitting 防止保存跳转回写）
+# Relay Hold：编辑草稿上报（0.8s 防抖；submitting 防止保存跳转回写）
 _EDIT_JS = ("<script>(function(){"
  "var ta=document.getElementById('content');if(!ta)return;"
  "var t=null,subm=false;"
@@ -434,8 +505,11 @@ _EDIT_JS = ("<script>(function(){"
  "window.addEventListener('pagehide',function(){if(!subm)sv();});})();</script>")
 
 def _rc_shell(title, body, extra_head=""):
+    # Relay Hold v2：全局 URL+滚动心跳注入（滚动位置由此恢复）
+    u = M.current_user()
+    js = M.hold_loc_js(u) if u else ""
     return (f"<!doctype html><html><head><meta charset='utf-8'>{extra_head}{M.STYLE}{M.ANIM_STYLE}"
-            f"{RC_STYLE}<title>{esc(title)}</title></head><body>{body}</body></html>")
+            f"{RC_STYLE}<title>{esc(title)}</title></head><body>{body}" + js + "</body></html>")
 
 # ---------------- 路由：作业总览 / 编辑 ----------------
 @bp.route("/rc")
@@ -444,7 +518,6 @@ def rc_home():
     if not u:
         return M.login_page()
     M.hold_page("rc")
-    # 手动强制刷新（节流 FORCE_REFRESH_MIN 秒）
     if request.args.get("refresh") == "1":
         if time.time() - _last_force[0] >= FORCE_REFRESH_MIN:
             _last_force[0] = time.time()
@@ -472,16 +545,22 @@ def rc_home():
         open_subj = h["edit"] if (h["edit"] and has_perm(u, h["edit"])) else ""
     can_edit_open = bool(open_subj) and has_perm(u, open_subj)
 
-    # 提示横幅：保存错误 / 令牌临期 / 缓存异常
     banner = ""
     serr = request.args.get("serr", "")
     if serr:
         banner += "<p class='err'>" + esc(serr) + "</p>"
+    if request.args.get("saved") == "offline":
+        banner += ("<p class='queue'>远端暂不可达：修改已暂存（Relay 离线队列），"
+                   "将在班级大屏/网络恢复后自动同步到 Classworks</p>")
+    pn = pending_count()
+    if pn:
+        banner += ("<p class='tip' style='color:#b7791f'>⏳ %d 条修改待同步到班级大屏"
+                   "（Classworks 暂不可达，恢复后自动上传）</p>" % pn)
     if _mode() == "token" and sget("rc_token"):
         rem = _token_exp(sget("rc_token")) - time.time()
         if rem <= 0:
-            banner += ("<p class='err'>KV 令牌已过期：当前仅能查看缓存内容，编辑不可用。"
-                       "请教师在管理页更新令牌（或改用鉴权模式）。</p>")
+            banner += ("<p class='err'>KV 令牌已过期：当前仅能查看缓存内容，"
+                       "新修改将进入离线队列。请教师在管理页更新令牌（或改用鉴权模式）。</p>")
         elif rem < 86400:
             banner += ("<p class='tip' style='color:#b7791f'>提示：KV 令牌将在 %.1f 小时后过期，"
                        "届时需要教师更新。</p>" % (rem / 3600))
@@ -494,11 +573,10 @@ def rc_home():
 
     items = ""
     for name in list_subjects(data):
-        qname = quote(name, safe="")   # 预计算：f-string 表达式内不得出现反斜杠/同型引号（Python<3.12）
+        qname = quote(name, safe="")   # 预计算：f-string 表达式内不得出现反斜杠/同型引号
         entry = hw.get(name) or {}
         content = str(entry.get("content") or "")
         if open_subj == name and can_edit_open:
-            # ---- 可编辑：textarea + 草稿恢复（Relay Hold） ----
             draft = hold_draft_load(u)
             ta_val = content
             draft_tip = ""
@@ -517,13 +595,11 @@ def rc_home():
                       "<p class='tip'>输入自动保存草稿（Relay Hold），闪退后重开自动恢复</p></div>"
                       + _EDIT_JS.replace("__SUBJ__", qname))
         elif open_subj == name:
-            # ---- 无权限：只读展开（Q4） ----
             items += (f"<div class='subcard' style='padding:8px 12px'>"
                       f"<div class='fname'>{esc(name)} · 只读</div></div>"
                       f"<div class='ro'>{esc(content or '（暂无内容）')}</div>"
                       "<a class='btn2' href='/rc'>收起</a>")
         else:
-            # ---- 折叠卡片：有权限浅蓝 / 无权限浅灰 ----
             meta = (content[:60] + "…") if len(content) > 60 else (content or "（暂无内容）")
             cls = "subcard perm" if has_perm(u, name) else "subcard"
             items += (f"<a class='{cls}' href='/rc?edit={qname}'>"
@@ -536,8 +612,7 @@ def rc_home():
             f"<a class='rrefresh' href='/rc?refresh=1'>⟳ 刷新</a></div>"
             f"<h3>RemoteClasswork · 班级作业</h3>"
             f"{banner}<p class='tip'>{esc(date_line)}（浅蓝=有编辑权限 · 浅灰=仅查看）</p>"
-            + items + M.REOPEN_TIP + M.FOOTER
-            + _SCROLL_JS.replace("__Y__", str(h["scroll"])))
+            + items + M.REOPEN_TIP + M.FOOTER)
     return _rc_shell("RemoteClasswork", body)
 
 @bp.route("/rc/save", methods=["POST"])
@@ -565,20 +640,11 @@ def rc_save():
         hold_draft_clear(u)
         hold_set(u, edit="")
         return redirect("/rc")
-    hold_set(u, edit=subject)              # 失败：保持编辑态与草稿，回到编辑页
-    return redirect("/rc?edit=" + quote(subject, safe="") + "&serr=" + quote(serr))
-
-@bp.route("/rc/hold", methods=["POST"])
-def rc_hold():
-    u = M.current_user()
-    if not u:
-        return "", 204
-    try:
-        y = int(float(request.form.get("scroll_y") or 0))
-    except (TypeError, ValueError):
-        y = 0
-    hold_set(u, scroll=y)
-    return "", 204
+    # 问题7：远端失败 -> 离线队列，用户体验等同保存成功
+    _queue_op(subject, content)
+    hold_draft_clear(u)
+    hold_set(u, edit="")
+    return redirect("/rc?saved=offline")
 
 @bp.route("/rc/draft", methods=["POST"])
 def rc_draft():
@@ -625,7 +691,7 @@ def admin_rc():
         elif act == "clearhold":
             M.dbq(RC_DB, "DELETE FROM drafts")
             M.dbq(RC_DB, "DELETE FROM holds")
-            msg = "已清空全部 Hold 草稿与页面位置"
+            msg = "已清空全部 Hold 草稿与编辑态"
         elif act == "clearcache":
             with _cache_lock:
                 CACHE.update({"ts": 0.0, "date": "", "data": None, "err": ""})
@@ -634,11 +700,18 @@ def admin_rc():
             except OSError:
                 pass
             msg = "本地缓存已清除（下次访问重新拉取）"
+        elif act == "syncnow":
+            _sync_once()
+            msg = "同步尝试完成，剩余待同步 %d 条" % pending_count()
+        elif act == "clearqueue":
+            M.dbq(RC_DB, "DELETE FROM pending_ops")
+            msg = "离线队列已清空"
     except Exception as e:
         msg = "操作失败：%s" % e
 
     with _cache_lock:
         cache_err, cache_ts = CACHE.get("err") or "", CACHE.get("ts") or 0.0
+    pn = pending_count()
     st_rows = ""
     for (n,) in M.dbq(RC_DB, "SELECT name FROM subjects ORDER BY rowid"):
         st_rows += ("<tr><td>%s</td><td><input name='perm_%s' value='%s'></td></tr>"
@@ -660,7 +733,15 @@ def admin_rc():
         test_html = "<h4>连接测试结果</h4><pre>" + esc("\n".join(test_out)) + "</pre>"
     body = (M.back_btn("/admin") + ("<p class='err'>" + esc(msg) + "</p>" if msg else "")
             + f"<p>当前模式：<b>{mode_line}</b> · 令牌剩余：{tok_rem or '—（鉴权模式自动续期）'} · "
-            f"缓存：{cache_age}{(' · 最近异常：' + esc(cache_err)[:80]) if cache_err else ''}</p>"
+            f"缓存：{cache_age} · 离线队列：<b>{pn}</b> 条"
+            f"{(' · 最近异常：' + esc(cache_err)[:80]) if cache_err else ''}</p>"
+            + "<h4>离线队列操作</h4><p>"
+            "<form method='post' action='/admin/remoteclasswork' style='display:inline'>"
+            "<input type='hidden' name='act' value='syncnow'>"
+            "<button class='mini'>立即同步</button></form> "
+            "<form method='post' action='/admin/remoteclasswork' style='display:inline'>"
+            "<input type='hidden' name='act' value='clearqueue'>"
+            "<button class='mini'>清空队列</button></form></p>"
             + "<form method='post' action='/admin/remoteclasswork'>"
             "<input type='hidden' name='act' value='save'>"
             "<h4>KV 连接（双模式互备）</h4>"
@@ -689,7 +770,7 @@ def admin_rc():
             "<h4>数据维护</h4><p>"
             "<form method='post' action='/admin/remoteclasswork' style='display:inline'>"
             "<input type='hidden' name='act' value='clearhold'>"
-            "<button class='mini'>清空全部 Hold 草稿与位置</button></form> "
+            "<button class='mini'>清空 Hold 草稿与编辑态</button></form> "
             "<form method='post' action='/admin/remoteclasswork' style='display:inline'>"
             "<input type='hidden' name='act' value='clearcache'>"
             "<button class='mini'>清除本地缓存</button></form></p>"

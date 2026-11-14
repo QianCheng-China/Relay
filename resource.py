@@ -2,12 +2,19 @@
 """
 Relay Resource 模块：课件查看 + Resource Librarian（扫描/索引双轨制）
 数据：data/resource/{resource.db, resource.log, index/<fid>.json, cache/<fid>/page-NNN.png}
-管线：Office(COM)->PDF->逐页PNG(1080px)；文本层提取；扫描件/图片走 Windows OCR；
+管线（Build 40 起）：Office 文档 → LibreOffice 无头转换 PDF（独立进程+独立 profile+
+      180s 硬超时，绝不触碰教师前台会话——修复"转换导致正在播放的课件闪退/弹框"）
+      → PyMuPDF 逐页 PNG(1080px)；文本层提取；扫描件/图片走 Windows OCR（可选）；
       AI 总结学科+关键词（独立并发2，AI 空闲/夜间窗口运行，忙碌自动让路）。
-Relay Hold：查看进度（hold_get/hold_save，路由 /resource/hold）——页码/缩放/平移闪退恢复。
-注意：PPT 动画按 Q2 决策退化为页面翻页；认证轻量浏览器全程零外部依赖。
+      ⚠ 不再依赖 pywin32 / Microsoft Office COM；需安装 LibreOffice（管理页可改路径）。
+Build 40 (v1.1) 变更：
+- LibreOffice 无头管线替换 COM（修复问题4：弹框/拖垮前台/Word 崩溃波及）。
+- 扫描排除 ~$ 锁文件与 .tmp（修复问题5 的无效文件与转换重试风暴）。
+- 提取文本 <30 字符跳过 AI 总结（修复空文本→提示词回声式幻觉关键词）；关键词黑名单。
+- 重建索引时同步清空 kw 表。
+- Relay Hold v2：列表滚动由主程序全局心跳接管；图片缩放/平移专用心跳保留。
 """
-import hashlib, json, os, queue, re, shutil, threading, time
+import hashlib, json, os, queue, re, shutil, subprocess, threading, time
 from datetime import datetime
 from html import escape as esc
 from urllib.parse import quote
@@ -16,14 +23,19 @@ from flask import Blueprint, redirect, request, send_file
 M = None
 AST = None
 
+_NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+LO_TIMEOUT = 180          # LibreOffice 单文件转换硬超时（秒）
+LO_PROFILE = None         # init 时赋值：独立 profile，杜绝任何交互弹窗
+
 def init(m, ast):
-    global M, AST, RES_DB, RES_LOG, INDEX_DIR, CACHE_DIR, log
+    global M, AST, RES_DB, RES_LOG, INDEX_DIR, CACHE_DIR, LO_PROFILE, log
     M, AST = m, ast
     RES_DB = os.path.join(M.DIR_RES, "resource.db")
     RES_LOG = os.path.join(M.DIR_RES, "resource.log")
     INDEX_DIR = os.path.join(M.DIR_RES, "index")
     CACHE_DIR = os.path.join(M.DIR_RES, "cache")
-    for d in (INDEX_DIR, CACHE_DIR):
+    LO_PROFILE = os.path.join(M.DIR_RES, "lo_profile")
+    for d in (INDEX_DIR, CACHE_DIR, LO_PROFILE):
         os.makedirs(d, exist_ok=True)
     log = M._mklog("relay.resource", RES_LOG)
     init_db()
@@ -33,6 +45,7 @@ def init(m, ast):
     _sdefault("night_start", "23:30")
     _sdefault("night_end", "06:30")
     _sdefault("idle_index", "0")
+    _sdefault("soffice_path", "")
     fd = json.loads(sget("folders"))[0] if json.loads(sget("folders")) else None
     if fd and not fd.startswith("\\\\"):
         try:
@@ -63,6 +76,9 @@ IMG = {".png", ".jpg", ".jpeg"}
 PAGE_W, THUMB_W, TPP = 1080, 160, 24
 OCR_PAGE_CAP = 60
 CONV_REFRESH = 5
+AI_MIN_TEXT = 30          # 提取文本少于此长度：跳过 AI 总结（防提示词回声幻觉）
+_KW_BLOCK = {"文件名", "内容摘录", "学科", "关键词", "关键词提取", "主题", "分析",
+             "输出", "json", "学科名", "格式要求", "其他"}
 
 # ---------------- DB ----------------
 def init_db():
@@ -103,6 +119,11 @@ def get_subjects():
     except Exception:
         return ["其他"]
 
+def _skip_name(fn):
+    """WPS/Office 属主锁文件与临时文件一律排除（修复 ~$ 文件涌入与转换重试风暴）。"""
+    n = fn.strip()
+    return n.startswith("~$") or n.lower().endswith(".tmp")
+
 _FKEYS = "fid name ext size mtime path subject pages conv idx err".split()
 
 def frow(fid):
@@ -127,7 +148,7 @@ def fmt_ts(t):
     except Exception:
         return "?"
 
-# ---------------- OCR（Windows.Media.Ocr，离线） ----------------
+# ---------------- OCR（Windows.Media.Ocr，离线，可选） ----------------
 _ocr_engine, _ocr_tried = None, False
 
 def _get_engine():
@@ -167,44 +188,59 @@ def ocr_bytes(data):
         log.warning("OCR 失败：%s", e)
         return ""
 
-# ---------------- 转换 / 渲染 ----------------
-def office_to_pdf(src, dst):
+# ---------------- LibreOffice 无头转换（Build 40：替换 COM，绝不触碰前台） ----------------
+def _soffice_path():
+    p = (sget("soffice_path") or "").strip()
+    if p and os.path.exists(p):
+        return p
+    for c in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+              r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+def _kill_tree(pid):
     try:
-        import pythoncom
-        import win32com.client
-    except Exception as e:
-        raise RuntimeError("缺少 pywin32/Office，无法转换文档：" + str(e))
-    pythoncom.CoInitialize()
-    app = None
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, creationflags=_NOWIN)
+    except Exception:
+        pass
+
+def office_to_pdf(src, outdir):
+    """LibreOffice 无头转换。独立短进程 + 独立 profile + 硬超时：
+    任何文件问题（损坏/被 WPS 锁定/加密）只表现为子进程失败，绝不弹窗、不影响前台。"""
+    soffice = _soffice_path()
+    if not soffice:
+        raise RuntimeError("未找到 soffice.exe：请安装 LibreOffice（默认路径），"
+                           "或在 Resource 管理页填写完整路径")
+    prof = LO_PROFILE.replace("\\", "/")
+    prof_url = "file:///" + quote(prof)
+    cmd = [soffice, "--headless", "--norestore", "--nolockcheck",
+           "-env:UserInstallation=" + prof_url,
+           "--convert-to", "pdf", "--outdir", outdir, src]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=_NOWIN)
     try:
-        if src.lower().endswith((".ppt", ".pptx")):
-            app = win32com.client.DispatchEx("PowerPoint.Application")
-            pres = app.Presentations.Open(src, True, False, False)
-            try:
-                pres.SaveAs(dst, 32)
-            except Exception:
-                pres.SaveCopyAs(dst, 32)
-            pres.Close()
-        else:
-            app = win32com.client.DispatchEx("Word.Application")
-            try:
-                app.DisplayAlerts = 0
-            except Exception:
-                pass
-            doc = app.Documents.Open(src)
-            try:
-                doc.SaveAs2(dst, 17)
-            except Exception:
-                doc.SaveAs(dst, 17)
-            doc.Close(False)
-        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-            raise RuntimeError("无转换产物（文件可能损坏或受密码保护）")
-    finally:
+        proc.wait(timeout=LO_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc.pid)
+        raise RuntimeError("转换超时（%d 秒），已强制终止" % LO_TIMEOUT)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    produced = os.path.join(outdir, stem + ".pdf")
+    target = os.path.join(outdir, "src.pdf")
+    if not os.path.exists(produced) or os.path.getsize(produced) == 0:
+        rc = proc.returncode
+        raise RuntimeError("LibreOffice 转换失败（退出码 %s）：文件可能损坏、加密或被占用" % rc)
+    if produced != target:
         try:
-            if app is not None:
-                app.Quit()
-        except Exception:
-            pass
+            os.replace(produced, target)
+        except OSError:
+            shutil.copyfile(produced, target)
+            try:
+                os.remove(produced)
+            except OSError:
+                pass
+    return target
 
 def render_pdf(fid, pdfsrc):
     if not HAVE_FITZ:
@@ -263,8 +299,7 @@ def _conv_one(fid):
             M.dbq(RES_DB, "UPDATE files SET conv='converting' WHERE fid=?", (fid,))
             cdir = os.path.join(CACHE_DIR, fid)
             os.makedirs(cdir, exist_ok=True)
-            pdf = os.path.join(cdir, "src.pdf")
-            office_to_pdf(row["path"], pdf)
+            pdf = office_to_pdf(row["path"], cdir)
             n = render_pdf(fid, pdf)
             M.dbq(RES_DB, "UPDATE files SET conv='ready', pages=?, err='' WHERE fid=?", (n, fid))
             log.info("转换完成 %s（%d 页）", row["name"], n)
@@ -277,11 +312,6 @@ def _conv_one(fid):
         M.dbq(RES_DB, "UPDATE files SET conv='failed', err=? WHERE fid=?", (str(e)[:300], fid))
 
 def _conv_loop():
-    try:
-        import pythoncom
-        pythoncom.CoInitialize()
-    except Exception:
-        pass
     while True:
         fid = _q.get()
         try:
@@ -325,7 +355,7 @@ def _do_scan():
         for dp, dn, fn in os.walk(root):
             for f in fn:
                 ext = os.path.splitext(f)[1].lower()
-                if ext not in EXTS:
+                if ext not in EXTS or _skip_name(f):
                     continue
                 p = os.path.join(dp, f)
                 try:
@@ -424,13 +454,26 @@ def _ai_idle():
         return True
     return st["waiting"] < 8 and st["active"] < max(1, st["limit"] // 2)
 
+def _clean_kws(kws):
+    out = []
+    for k in kws or []:
+        k = str(k).strip()
+        if not k or k in _KW_BLOCK or k.lower() in _KW_BLOCK:
+            continue
+        if k not in out:
+            out.append(k)
+    return out[:8]
+
 def _ai_summary(name, text):
     subjects = get_subjects()
     prompt = ("以下是课件文件信息，请判断学科并提取关键词/主题。\n"
               "文件名：" + name + "\n可选学科：" + "、".join(subjects) + "\n"
               "内容摘录：\n" + text[:4000] +
               '\n只输出 JSON：{"subject":"学科名或 其他","keywords":["关键词",…]}，'
-              "keywords 最多 8 个，每个不超过 10 字。")
+              "keywords 最多 8 个，每个不超过 10 字。"
+              "keywords 必须取自内容本身的具体概念（术语/知识点/方法/人物等），"
+              "严禁复述提示词中的字段名（如“文件名”“内容摘录”“学科”“关键词”“主题”“分析”等），"
+              "严禁输出与内容无关的通用词。")
     payload = {"model": M.AI_MODEL,
                "messages": [{"role": "system", "content": "你是文档分析器。只输出 JSON，不要输出其他文字。"},
                             {"role": "user", "content": prompt}],
@@ -446,8 +489,7 @@ def _ai_summary(name, text):
             sub = str(obj.get("subject") or "其他").strip()
             if sub not in subjects and sub != "其他":
                 sub = "其他"
-            kws = [str(k).strip()[:20] for k in (obj.get("keywords") or []) if str(k).strip()][:8]
-            return sub, kws
+            return sub, _clean_kws(obj.get("keywords"))
         except Exception as e:
             log.warning("AI 总结失败 %s：%s", name, e)
             time.sleep(2)
@@ -516,6 +558,11 @@ def _index_one(fid):
         log.exception("文本提取失败 fid=%s", fid)
         _mark_idx(fid, "failed", "提取失败：" + str(e)[:120])
         return
+    # 修复问题5：无可提取文本时绝不调用 AI（防止提示词回声式幻觉关键词），仅文件名可检索
+    if len(text.strip()) < AI_MIN_TEXT:
+        _mark_idx(fid, "text_only", "无可提取文本（图片/扫描件无文字或未装OCR），仅文件名可检索")
+        log.info("索引完成(无文本) %s", row["name"])
+        return
     while AST and not _ai_idle():
         _idx_state["yielding"] = True
         time.sleep(30)
@@ -575,9 +622,9 @@ def start_background():
     threading.Thread(target=_indexer_loop, daemon=True).start()
     threading.Thread(target=_conv_loop, daemon=True).start()
     threading.Thread(target=lambda: (time.sleep(1), scan_now()), daemon=True).start()
-    log.info("Resource 后台线程已启动（扫描/索引/转换队列）")
+    log.info("Resource 后台线程已启动（扫描/索引/LibreOffice转换队列）")
 
-# ---------------- Relay Hold：查看进度（闪退恢复） ----------------
+# ---------------- Relay Hold：图片缩放/平移（文档页码由全局 URL 心跳+服务端兜底） ----------------
 def hold_get(u, fid):
     r = M.dbq(RES_DB, "SELECT page,scale,pan_x,pan_y FROM progress WHERE user=? AND fid=?", (u, fid))
     if r:
@@ -614,7 +661,7 @@ _IMG_JS = ("<script>(function(){"
  "function sv(){if(t)clearTimeout(t);t=setTimeout(function(){var x=new XMLHttpRequest();"
  "x.open('POST','/resource/hold',true);"
  "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
- "x.send('fid=__FID__&page=1&scale='+s+'&pan_x='+px+'&pan_y='+py);},600);}"
+ "x.send('fid=__FID__&page=1&scale='+s+'&pan_x='+px+'&pan_y='+py);},400);}"
  "function z(f){s=Math.min(5,Math.max(1,s*f));cl();ap();sv();}"
  "function rs(){s=1;px=0;py=0;ap();sv();}"
  "function ds(x,y){dr=true;lx=x;ly=y;}"
@@ -639,8 +686,11 @@ _PPT_JS = ("<script>(function(){var x=0,y=0;"
  "if((dx<-60||dy<-60)&&__NH__)location.href=__NU__;else if((dx>60||dy>60)&&__PH__)location.href=__PU__;},false);})();</script>")
 
 def _page_shell(title, body, extra_head=""):
+    # Relay Hold v2：所有用户页面注入全局 URL+滚动心跳
+    u = M.current_user()
+    js = M.hold_loc_js(u) if u else ""
     return (f"<!doctype html><html><head><meta charset='utf-8'>{extra_head}{M.STYLE}{M.ANIM_STYLE}"
-            f"{VSTYLE}<title>{esc(title)}</title></head><body>{body}</body></html>")
+            f"{VSTYLE}<title>{esc(title)}</title></head><body>{body}" + js + "</body></html>")
 
 def _slink(q, sf, sd, cur_f, cur_d, label):
     on = " on" if (sf == cur_f and sd == cur_d) else ""
@@ -755,7 +805,7 @@ def res_view(fid):
     except ValueError:
         p = prog["page"]
     p = max(1, min(pages, p))
-    hold_save(u, fid, page=p)   # Relay Hold：页码记忆 -> 闪退恢复
+    hold_save(u, fid, page=p)   # 服务端兜底；主恢复链路由全局 URL 心跳承担
 
     vurl = "/resource/view/" + fid
     if request.args.get("thumbs"):
@@ -904,6 +954,10 @@ def admin_resource():
             sset("night_start", request.form.get("ns", "23:30").strip() or "23:30")
             sset("night_end", request.form.get("ne", "06:30").strip() or "06:30")
             sset("idle_index", "1" if request.form.get("idle") == "1" else "0")
+            sp = request.form.get("soffice", "").strip()
+            sset("soffice_path", sp)
+            if sp and not os.path.exists(sp):
+                msg = "注意：soffice.exe 路径不存在，Office 文档将转换失败；"
             for fd in folders:
                 if not fd.startswith("\\\\"):
                     try:
@@ -911,7 +965,7 @@ def admin_resource():
                     except OSError:
                         pass
             threading.Thread(target=scan_now, daemon=True).start()
-            msg = "设置已保存，并已触发一次扫描"
+            msg = (msg or "") + "设置已保存，并已触发一次扫描"
         elif act == "scan":
             threading.Thread(target=scan_now, daemon=True).start()
             msg = "已触发扫描（片刻后刷新查看）"
@@ -931,7 +985,8 @@ def admin_resource():
                 except OSError:
                     pass
             M.dbq(RES_DB, "UPDATE files SET idx='pending'")
-            msg = "已请求重建全部索引（将在夜间窗口或 AI 空闲时执行）"
+            M.dbq(RES_DB, "DELETE FROM kw")   # Build 40：重建时同步清空关键词表（清洗旧幻觉数据）
+            msg = "已请求重建全部索引（含旧关键词清洗；将在夜间窗口或 AI 空闲时执行）"
         elif act == "clearcache":
             for d in os.listdir(CACHE_DIR):
                 shutil.rmtree(os.path.join(CACHE_DIR, d), ignore_errors=True)
@@ -957,6 +1012,7 @@ def admin_resource():
     st, sttxt = _indicator()
     pend = M.dbq(RES_DB, "SELECT COUNT(*) FROM files WHERE idx='pending'")[0][0]
     cur = _idx_state.get("current") or "—"
+    soffice_ok = bool(_soffice_path())
     failed = M.dbq(RES_DB, "SELECT fid,name,err FROM files WHERE conv='failed' ORDER BY name")
     frows = "".join(
         f"<tr><td>{esc(r[1])}</td><td class='tip'>{esc(r[2] or '')[:120]}</td>"
@@ -964,11 +1020,16 @@ def admin_resource():
         f"<input type='hidden' name='act' value='retry'><input type='hidden' name='fid' value='{r[0]}'>"
         f"<button class='mini'>重试</button></form></td></tr>" for r in failed)
     body = (M.back_btn("/admin") + ("<p class='err'>" + esc(msg) + "</p>" if msg else "")
-            + f"<p>索引状态：<span class='stchip {st}'>{sttxt}</span> · 待索引 {pend} · "
+            + f"<p>LibreOffice：<span class='stchip {'done' if soffice_ok else 'pend'}'>"
+            f"{'已就绪' if soffice_ok else '未找到（Office 文档将无法转换）'}</span> · "
+            f"索引状态：<span class='stchip {st}'>{sttxt}</span> · 待索引 {pend} · "
             f"当前：{esc(cur)} · 让路中：{'是' if _idx_state['yielding'] else '否'}</p>"
             + "<form method='post' action='/admin/resource'>"
             "<input type='hidden' name='act' value='save'>"
-            "<h4>课件文件夹（每行一个，支持本地盘与 UNC 路径）</h4>"
+            "<h4>soffice.exe 路径（留空=自动探测默认安装位置）</h4>"
+            f"<input name='soffice' value='{esc(sget('soffice_path'))}' "
+            f"placeholder='C:\\Program Files\\LibreOffice\\program\\soffice.exe'>"
+            "<h4>课件文件夹（每行一个，支持本地盘与 UNC 路径；勿含相机照片目录）</h4>"
             f"<textarea name='folders' rows='4'>{esc(folders)}</textarea>"
             "<h4>学科列表（逗号分隔；判不出的归“其他”）</h4>"
             f"<input name='subjects' value='{esc(subjects)}'>"
@@ -985,7 +1046,7 @@ def admin_resource():
             "<form method='post' action='/admin/resource' style='display:inline'>"
             "<input type='hidden' name='act' value='warm'><button class='mini'>预热全部转换</button></form> "
             "<form method='post' action='/admin/resource' style='display:inline'>"
-            "<input type='hidden' name='act' value='rebuild'><button class='mini'>重建全部索引</button></form> "
+            "<input type='hidden' name='act' value='rebuild'><button class='mini'>重建全部索引（清洗旧关键词）</button></form> "
             "<form method='post' action='/admin/resource' style='display:inline'>"
             "<input type='hidden' name='act' value='clearcache'><button class='mini'>清空渲染缓存</button></form></p>"
             + ("<h4>转换失败的文件</h4><table border='1'><tr><th>文件</th><th>原因</th><th>操作</th></tr>"
