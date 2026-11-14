@@ -1,0 +1,16 @@
+{
+  "apps": [
+    {"key": "assistant", "module": "assistant", "title": "Assistant", "desc": "向 GLM 4 Flash 提问",
+     "admin_url": "/admin/assistant", "admin_desc": "账号数据/Token · 询问记录 · 联网搜索 · 上下文 · 公式渲染自检"},
+    {"key": "resource", "module": "resource", "title": "Resource", "desc": "查看图像，文档和演示文稿",
+     "admin_url": "/admin/resource", "admin_desc": "课件文件夹 · LibreOffice 路径 · 索引计划 · 手动扫描 / 重建 / 预热"},
+    {"key": "rc", "module": "remoteclasswork", "title": "RemoteClasswork", "desc": "查看并编辑班级作业",
+     "admin_url": "/admin/remoteclasswork", "admin_desc": "KV 连接（令牌 / 鉴权双模式）· 学科权限 · 离线队列"},
+    {"key": "dictionary", "module": "dictionary", "title": "Dictionary", "desc": "查询词典",
+     "admin_url": "/admin/dictionary", "admin_desc": "mobi 词典导入与管理"},
+    {"key": "weather", "module": "weather", "title": "Weather", "desc": "查看天气变化与天气预报",
+     "admin_url": "/admin/weather", "admin_desc": "城市配置 · 天数与刷新间隔 · 拉取测试"},
+    {"key": "music", "module": "music", "title": "Music", "desc": "播放音乐与听力材料",
+     "admin_url": "/admin/music", "admin_desc": "音乐目录 · 扫描 · 统计 · 播放记录维护"}
+  ]
+}

@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Relay 1.1 主程序（壳）
+Relay 1.2 主程序（壳）
 ------------------------
-组成：relay_main.py(本文件) + assistant.py(AI问答) + resource.py(课件)
-      + remoteclasswork.py(班级作业) 四 Blueprint，waitress 生产服务器。
+组成：功能模块由 relay_apps.json 声明并动态挂载（Build 41 起），
+      内置 assistant/resource/remoteclasswork/dictionary/weather；
+      waitress 生产服务器。
 运行：python relay_main.py （监听 0.0.0.0:80，128 线程）
-依赖：pip install flask waitress dnslib requests markdown ziamath pymupdf
-      （winrt 可选：扫描件/图片 OCR；pywin32 已于 Build 40 移除——Office 文档改走 LibreOffice）
-      另需安装 LibreOffice（默认路径即可，可在 Resource 管理页改路径）。
-Build 40 (v1.1 · HGH) 变更：
-- Relay Hold v2：全局"URL+滚动位置"3 秒心跳（/hold/loc），登录后 / 按 last_url
-  完整恢复（白名单校验+7 天时效）；DB 新增 accounts.last_url/last_scroll/last_loc_ts。
-- DNS 模式系统：probe（默认，仅劫持探测域名，教师机正常上网）/ hijack / pass，
-  在"通用管理"页切换（存 DB，弃用环境变量）；内置三星/安卓探测域；
-  www.msftconnecttest.com / dns.msftncsi.com 硬排除（保护 Windows 自检）。
-- /admin/dns 网络诊断页：模式/劫持列表编辑/最近查询记录/承载网络关联客户端实时状态。
-- 管理页重组：Token 数据与最近提问移入 Assistant 管理；Hold 一键维护移入通用管理。
-- v0.2.0 起移除内置自修复体系；数据目录 data/{common,assistant,resource,remoteclasswork}。
+依赖：flask waitress dnslib requests markdown ziamath pymupdf（winrt 可选）
+新增功能（Build 41）：
+- relay_apps.json 配置文件化：功能名称/代码路径/描述/管理入口均由配置声明；
+  新增 App = 写一个 .py + json 加一行 + 重启，relay_main 零改动；
+  配置缺失/损坏时回退内置最小列表；单个模块加载失败仅记录日志并跳过。
+- 新增 Dictionary（mobi/prc 词典查询，自带解析器零依赖）与 Weather（小米天气）。
+其余（Hold v2 / DNS 模式 / 网络诊断）与 Build 40 一致，见各函数注释。
 """
-import collections, logging, os, re, secrets, socket, sqlite3, subprocess, sys, threading, time
+import collections, importlib, json, logging, os, re, secrets, socket, sqlite3
+import subprocess, sys, threading, time
 from datetime import datetime
 from html import escape as esc
 from socketserver import ThreadingMixIn
@@ -30,9 +27,9 @@ from waitress import serve
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------- 版本（唯一管理处） ----------
-RELAY_VERSION = "1.1"
-RELAY_CODENAME = "HGH"
-RELAY_BUILD = 40
+RELAY_VERSION = "2.0"
+RELAY_CODENAME = "CKG"
+RELAY_BUILD = 42
 __version__ = RELAY_VERSION
 
 APP_NAME = "Relay"
@@ -45,10 +42,13 @@ DIR_COMMON = os.path.join(DATA, "common")
 DIR_AST = os.path.join(DATA, "assistant")
 DIR_RES = os.path.join(DATA, "resource")
 DIR_RC = os.path.join(DATA, "remoteclasswork")
+DIR_DICT = os.path.join(DATA, "dictionary")
+DIR_WX = os.path.join(DATA, "weather")
 COMMON_DB = os.path.join(DIR_COMMON, "accounts.db")
 LOG_PATH = os.path.join(DIR_COMMON, "relay.log")
 KEY_PATH = os.path.join(BASE, "key.txt")
-for _d in (DIR_COMMON, DIR_AST, DIR_RES, DIR_RC):
+APPS_PATH = os.path.join(BASE, "relay_apps.json")
+for _d in (DIR_COMMON, DIR_AST, DIR_RES, DIR_RC, DIR_DICT, DIR_WX):
     os.makedirs(_d, exist_ok=True)
 
 # ---------- 配置区 ----------
@@ -58,27 +58,18 @@ DNS_PORT = int(os.environ.get("HS_DNS_PORT", "53"))
 UPSTREAM_DNS = "223.5.5.5"
 WHITELIST = {
     "open.bigmodel.cn", "time.windows.com", "ntp.aliyun.com",
-    "kv-service.wuyuan.dev",      # RemoteClasswork 作业数据（必保留）
-    "openid.zero-cat.dev",        # 仅 refresh_token 续期用
-    # "kv.houlang.cloud",
+    "kv-service.wuyuan.dev",           # RemoteClasswork
+    "openid.zero-cat.dev",             # 仅 refresh_token 续期用
+    "weatherapi.market.xiaomi.com",    # Weather 拉取（Build 41 新增，必保留）
 }
-# probe 模式默认劫持列表（安卓/三星探测域；可在 /admin/dns 增删）
 DEFAULT_PROBE_HOSTS = [
-    "connectivitycheck.gstatic.com",     # Android 标准
-    "www.google.com",                    # Android 生成 204
-    "connectivitycheck.android.com",
-    "play.googleapis.com",
-    "www.gstatic.cn",                    # 三星国行 / 中国区
-    "captive.apple.com",                 # iPad 兜底
-    "connect.rom.miui.com",
-    "wifi.vivo.com.cn",
-    "conn1.oppomobile.com",
+    "connectivitycheck.gstatic.com", "www.google.com", "connectivitycheck.android.com",
+    "play.googleapis.com", "www.gstatic.cn", "captive.apple.com",
+    "connect.rom.miui.com", "wifi.vivo.com.cn", "conn1.oppomobile.com",
     "connectivitycheck.platform.hicloud.com",
 ]
-# 硬排除：Windows 联网自检域名，永不劫持（教师机任务栏判定依赖它）
 DNS_GUARD = {"www.msftconnecttest.com", "dns.msftncsi.com", "ipv6.msftconnecttest.com"}
-HOLD_URL_PREFIXES = ("/home", "/assistant", "/result", "/resource", "/rc")
-HOLD_URL_MAX_AGE = 7 * 24 * 3600     # last_url 超过 7 天不再强制恢复
+HOLD_URL_MAX_AGE = 7 * 24 * 3600
 HTTP_PORT = int(os.environ.get("HS_HTTP_PORT", "80"))
 HTTP_THREADS = 128
 ADMIN_PASSWORD = "admin123"   # 管理密码（部署后务必修改）
@@ -95,6 +86,66 @@ def _mklog(name, path):
     return lg
 
 log = _mklog("relay.main", LOG_PATH)
+
+# ---------- App 配置（relay_apps.json，Build 41） ----------
+_DEFAULT_APPS = [
+    {"key": "assistant",  "module": "assistant",       "title": "Assistant",
+     "desc": "向 GLM 4 Flash 提问",
+     "admin_url": "/admin/assistant",
+     "admin_desc": "账号数据/Token · 询问记录 · 联网搜索 · 上下文 · 公式渲染自检"},
+    {"key": "resource",   "module": "resource",        "title": "Resource",
+     "desc": "查看图像，文档和演示文稿",
+     "admin_url": "/admin/resource",
+     "admin_desc": "课件文件夹 · LibreOffice 路径 · 索引计划 · 手动扫描 / 重建 / 预热"},
+    {"key": "rc",         "module": "remoteclasswork", "title": "RemoteClasswork",
+     "desc": "查看并编辑班级作业（与班级大屏实时同步）",
+     "admin_url": "/admin/remoteclasswork",
+     "admin_desc": "KV 连接（令牌 / 鉴权双模式）· 学科权限 · 离线队列"},
+    {"key": "dictionary", "module": "dictionary",      "title": "Dictionary",
+     "desc": "查询词典",
+     "admin_url": "/admin/dictionary",
+     "admin_desc": "mobi 词典导入与管理"},
+    {"key": "weather",    "module": "weather",         "title": "Weather",
+     "desc": "查看天气变化与天气预报",
+     "admin_url": "/admin/weather",
+     "admin_desc": "城市配置 · 天数与刷新间隔 · 拉取测试"},
+]
+_APPKEY_RE = re.compile(r"^[a-z0-9]{1,24}$")
+
+
+
+def _load_apps():
+    try:
+        with open(APPS_PATH, "r", encoding="utf-8-sig") as f:
+            obj = json.load(f)
+        apps, seen = [], set()
+        for a in obj.get("apps", []):
+            k = str(a.get("key") or "").strip().lower()
+            mod = str(a.get("module") or "").strip()
+            if not _APPKEY_RE.match(k) or not mod or k in seen:
+                log.warning("relay_apps.json 中无效或重复的条目已忽略：%r", a)
+                continue
+            seen.add(k)
+            apps.append({"key": k, "module": mod,
+                         "title": str(a.get("title") or k),
+                         "desc": str(a.get("desc") or ""),
+                         "admin_url": str(a.get("admin_url") or ""),
+                         "admin_desc": str(a.get("admin_desc") or "")})
+        if apps:
+            log.info("relay_apps.json 已加载：%s", "、".join(a["key"] for a in apps))
+            return apps
+        log.error("relay_apps.json 中无有效条目，使用内置列表")
+    except FileNotFoundError:
+        log.error("未找到 relay_apps.json，使用内置最小功能列表")
+    except Exception as e:
+        log.error("relay_apps.json 解析失败（%s），使用内置最小功能列表", e)
+    return [dict(x) for x in _DEFAULT_APPS]
+
+APPS = _load_apps()
+# Hold v2：模块 key → 入口路径；URL 前缀白名单（含 /dictionary /weather，自动生成）
+HOLD_MAP = {a["key"]: "/" + a["key"] for a in APPS}
+HOLD_URL_PREFIXES = tuple("/" + a["key"] for a in APPS)
+
 
 # ---------- key.txt ----------
 def _load_config():
@@ -138,7 +189,6 @@ def cset(key, value):
     dbq(COMMON_DB, "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
 
 def init_common_db():
-    # accounts.last_page 沿用旧名（数据兼容）；Hold v2 新增三列
     dbq(COMMON_DB, """CREATE TABLE IF NOT EXISTS accounts(
         username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, device_id TEXT,
         bound_at TEXT, last_seen TEXT, last_query TEXT,
@@ -212,8 +262,6 @@ def current_user():
     return user if (sdev == dev and adev == dev) else None
 
 # ---------- Relay Hold v2：功能页 + 完整 URL + 滚动位置 ----------
-HOLD_MAP = {"assistant": "/assistant", "resource": "/resource", "rc": "/rc"}
-
 def hold_page(key):
     u = current_user()
     if u:
@@ -227,7 +275,6 @@ def _cur_url():
     return request.path + (("?" + qs) if qs else "")
 
 def hold_scroll_for(u):
-    """Hold v2：仅当当前请求 URL 与存储的 last_url 一致（闪退恢复场景）时返回保存的滚动值。"""
     try:
         r = dbq(COMMON_DB, "SELECT last_url, last_scroll FROM accounts WHERE username=?", (u,))
         if r and r[0][0] and r[0][0] == _cur_url():
@@ -236,7 +283,6 @@ def hold_scroll_for(u):
         pass
     return 0
 
-# 全局心跳 JS（ES5）：3 秒间隔 + 滚动变化即发 + pagehide 同步补发；恢复时三次尝试 scrollTo
 HOLD_LOC_JS = ("<script>(function(){"
  "var lastU=null,lastY=-1,t=null;"
  "function cu(){return location.pathname+location.search;}"
@@ -259,7 +305,6 @@ HOLD_LOC_JS = ("<script>(function(){"
  "})();</script>")
 
 def hold_loc_js(u):
-    """模块页面 shell 一行接入：注入全局心跳 JS；滚动恢复值由服务端决定。"""
     try:
         sy = hold_scroll_for(u) if u else 0
     except Exception:
@@ -391,7 +436,8 @@ def finish(resp):
     if getattr(g, "new_dev", None) and not request.cookies.get(COOKIE_DEV):
         resp.set_cookie(COOKIE_DEV, g.new_dev, max_age=COOKIE_MAX_AGE, httponly=True, path="/")
     mt = resp.mimetype or ""
-    resp.headers["Cache-Control"] = "private, max-age=86400" if mt.startswith("image/") else "no-store"
+    resp.headers["Cache-Control"] = ("private, max-age=86400"
+        if (mt.startswith("image/") or mt.startswith("audio/")) else "no-store")
     return resp
 
 # ---------- 基础路由 ----------
@@ -412,7 +458,6 @@ def root():
             last_ts = float(r[0][2] or 0)
         except (TypeError, ValueError):
             last_ts = 0.0
-    # Hold v2：完整 URL 恢复（前缀白名单 + 时效校验）
     if (last_url and last_url.startswith(HOLD_URL_PREFIXES)
             and time.time() - last_ts < HOLD_URL_MAX_AGE):
         return redirect(last_url)
@@ -424,14 +469,12 @@ def home():
     if not u:
         return login_page()
     hold_page("home")
+    cards = ""
+    for a in APPS:
+        cards += ("<a class='card' href='/%s'><b>%s</b><span>%s</span></a>"
+                  % (esc(a["key"]), esc(a["title"]), esc(a["desc"])))
     body = (f"<p class='tip'>当前账号：{esc(u)} <a href='/unbind'>解绑本设备</a></p>"
-            "<a class='card' href='/assistant'><b>Assistant</b>"
-            "<span>向 GLM 4 Flash 提问</span></a>"
-            "<a class='card' href='/resource'><b>Resource</b>"
-            "<span>查看图像，文档和演示文稿</span></a>"
-            "<a class='card' href='/rc'><b>RemoteClasswork</b>"
-            "<span>查看并编辑班级作业（与班级大屏实时同步）</span></a>"
-            + REOPEN_TIP + FOOTER)
+            + cards + REOPEN_TIP + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}"
             f"<title>{APP_NAME}</title></head><body><h3>{APP_NAME} · 功能列表</h3>{body}"
             + hold_loc_js(u) + "</body></html>")
@@ -518,17 +561,17 @@ def admin():
         return admin_login_page("管理密码错误")
     if not admin_ok():
         return admin_login_page()
+    app_cards = ""
+    for a in APPS:
+        if a.get("admin_url"):
+            app_cards += ("<a class='card' href='%s'><b>%s 管理</b><span>%s</span></a>"
+                          % (esc(a["admin_url"]), esc(a["title"]), esc(a["admin_desc"])))
     body = ("<p>选择管理模块：</p>"
             "<a class='card' href='/admin/common'><b>通用管理</b>"
             "<span>账号管理 · DNS 劫持模式 · Relay Hold 一键维护</span></a>"
             "<a class='card' href='/admin/dns'><b>网络诊断</b>"
             "<span>劫持列表 · 最近查询 · 承载网络关联客户端实时状态</span></a>"
-            "<a class='card' href='/admin/assistant'><b>Assistant 管理</b>"
-            "<span>账号数据/Token · 询问记录 · 联网搜索 · 上下文 · 公式渲染自检</span></a>"
-            "<a class='card' href='/admin/resource'><b>Resource 管理</b>"
-            "<span>课件文件夹 · LibreOffice 路径 · 索引计划 · 手动扫描 / 重建 / 预热</span></a>"
-            "<a class='card' href='/admin/remoteclasswork'><b>RemoteClasswork 管理</b>"
-            "<span>KV 连接（令牌 / 鉴权双模式）· 学科权限 · 离线队列 · Hold 维护</span></a>"
+            + app_cards +
             "<p class='tip'><a href='/'>打开门户首页</a> <a href='/admin'>刷新</a></p>" + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}<title>管理</title>"
             f"</head><body><h3>{APP_NAME} · 管理中心</h3>{body}</body></html>")
@@ -585,20 +628,19 @@ def admin_common():
             _dns_mode_cache[1] = 0.0
             msg = "DNS 劫持模式已切换为 " + m + "（即时生效）"
         elif act == "clearhold_all":
-            try:
-                _ast_mod.hold_draft_clear_all()
-                dbq(_ast_mod.AST_DB, "DELETE FROM jobs")
-            except Exception:
-                pass
-            try:
-                dbq(_rc_mod.RC_DB, "DELETE FROM holds")
-                dbq(_rc_mod.RC_DB, "DELETE FROM drafts")
-            except Exception:
-                pass
-            try:
-                dbq(_res_mod.RES_DB, "DELETE FROM progress")
-            except Exception:
-                pass
+            # 直接按固定 DB 路径清理各模块 Hold 数据（模块无关，配置化后依然有效）
+            for _p, _sql in ((os.path.join(DIR_AST, "assistant.db"), "DELETE FROM drafts"),
+                             (os.path.join(DIR_AST, "assistant.db"), "DELETE FROM jobs"),
+                             (os.path.join(DIR_RC, "rc.db"), "DELETE FROM holds"),
+                             (os.path.join(DIR_RC, "rc.db"), "DELETE FROM drafts"),
+                             (os.path.join(DIR_RES, "resource.db"), "DELETE FROM progress"),
+                             (os.path.join(DATA, "music", "music.db"), "DELETE FROM progress"),
+                             (os.path.join(DATA, "music", "music.db"), "DELETE FROM prefs")):
+
+                try:
+                    dbq(_p, _sql)
+                except Exception:
+                    pass
             dbq(COMMON_DB, "UPDATE accounts SET last_url='', last_scroll=0, "
                            "last_loc_ts=0, last_page='home'")
             msg = "已清空全部 Relay Hold 数据（草稿/页面位置/滚动位置），用户下次进入为全新状态"
@@ -622,7 +664,7 @@ def admin_common():
     def _ck(v):
         return " checked" if mode == v else ""
     body = (head
-            + "<p>账号 Token 用量与最近提问数据已移至 <a href='/admin/assistant'>Assistant 管理</a>；"
+            + "<p>账号 Token 用量与最近提问数据在 <a href='/admin/assistant'>Assistant 管理</a>；"
             "网络诊断见 <a href='/admin/dns'>网络诊断页</a>。</p>"
             "<table border='1'><tr><th>账号</th><th>绑定设备</th><th>绑定时间</th><th>最后活跃</th>"
             "<th>操作</th></tr>" + trs + "</table>"
@@ -650,8 +692,7 @@ def admin_common():
             "<label><input type='radio' name='mode' value='pass'" + _ck("pass") + ">"
             "pass（全放行，排障用）</label>"
             "<button type='submit'>保存模式</button></form>"
-            "<p class='tip'>探测域名列表与最近查询请见 <a href='/admin/dns'>网络诊断页</a>"
-            "（平板不弹认证页时，用它找出自家 ROM 的探测域名并加入列表）</p>"
+            "<p class='tip'>探测域名列表与最近查询请见 <a href='/admin/dns'>网络诊断页</a></p>"
             "<h4>Relay Hold 维护</h4>"
             "<form method='post' action='/admin/common'>"
             "<input type='hidden' name='act' value='clearhold_all'>"
@@ -711,7 +752,7 @@ class Resolver(BaseResolver):
     def resolve(self, request, handler):
         try:
             name = str(request.q.qname).lower().rstrip(".")
-            if name in DNS_GUARD:          # Windows 自检域名：永不劫持
+            if name in DNS_GUARD:
                 return _fwd(request)
             if name in WHITELIST:
                 return _fwd(request)
@@ -749,26 +790,20 @@ def start_dns():
 
 # ---------- 网络诊断页 ----------
 def _hosted_status():
-    """承载网络实时状态（netsh 输出本地化，但 MAC 地址正则跨语言）。"""
-    out = ""
-    macs = []
+    macs, raw = [], ""
     try:
-        out = subprocess.run(["netsh", "wlan", "show", "hostednetwork"],
+        raw = subprocess.run(["netsh", "wlan", "show", "hostednetwork"],
                              capture_output=True, text=True, timeout=8,
                              creationflags=_NO_WINDOW).stdout or ""
         seen = []
-        for m in re.findall(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", out):
-            mm = m if isinstance(m, str) else m.group(0)
-        # findall with group returns full match strings here (no groups captured beyond), normalize:
-        macs = []
-        for tok in re.findall(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", out):
+        for tok in re.findall(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", raw):
             t = tok.lower()
             if t not in seen:
                 seen.append(t)
         macs = seen
     except Exception as e:
-        out = "获取失败：%s" % e
-    return macs, out
+        raw = "获取失败：%s" % e
+    return macs, raw
 
 @app.route("/admin/dns", methods=["GET", "POST"])
 def admin_dns():
@@ -850,26 +885,34 @@ def admin_dns():
             "<h4>最近 DNS 查询（最近 60 条，劫持=是 的域名即门户触发源）</h4>"
             "<table border='1'><tr><th>时间</th><th>域名</th><th>劫持</th></tr>"
             + (rrows or "<tr><td colspan='3' class='tip'>暂无记录</td></tr>") + "</table>"
-            "<p class='tip'>平板不弹认证页时：让其连上热点，观察此处是否有新域名被查询但未劫持，"
-            "将其加入上方列表即可</p>"
-            "<h4>承载网络实时状态（关联客户端 MAC %d 个，含 BSSID）</h4>"
+            "<h4>承载网络实时状态（关联客户端 MAC " + str(len(macs)) + " 个，含 BSSID）</h4>"
             "<pre>" + esc(raw) + "</pre>"
             + "<p class='tip'><a href='/admin'>返回管理中心</a></p>" + FOOTER)
     return (f"<!doctype html><html><head><meta charset='utf-8'>{STYLE}<title>网络诊断</title>"
             f"</head><body><h3>{APP_NAME} · 网络诊断</h3>{body}</body></html>")
 
-# ===== 挂载子模块（init 注入依赖，避免循环导入） =====
-import assistant as _ast_mod
-import resource as _res_mod
-import remoteclasswork as _rc_mod
-_ast_mod.init(sys.modules[__name__])
-_res_mod.init(sys.modules[__name__], _ast_mod)
-_rc_mod.init(sys.modules[__name__])
-app.register_blueprint(_ast_mod.bp)
-app.register_blueprint(_res_mod.bp)
-app.register_blueprint(_rc_mod.bp)
+# ===== 按 relay_apps.json 挂载子模块（两轮：先 import 后 init/register） =====
+# 统一 init 签名：def init(m, ast=None)；resource 使用 ast（Assistant 让路判断），
+# 其余模块可忽略；assistant 建议在配置中排在首位。
+_loaded = []
+_ast_mod = None
+for _a in APPS:
+    try:
+        _m = importlib.import_module(_a["module"])
+        _loaded.append((_a, _m))
+        if _a["key"] == "assistant":
+            _ast_mod = _m
+    except Exception:
+        log.exception("模块 %s (%s) 加载失败，已跳过（不影响其他模块）", _a["key"], _a["module"])
+for _a, _m in _loaded:
+    try:
+        _m.init(sys.modules[__name__], _ast_mod)
+        app.register_blueprint(_m.bp)
+        log.info("模块 %s (%s) 已挂载", _a["key"], _a["module"])
+    except Exception:
+        log.exception("模块 %s (%s) init 失败，已跳过", _a["key"], _a["module"])
 
-# 探测兜底 + 未知路径回门户（具体路由优先于本通配规则）
+# 探测兜底 + 未知路径回门户
 _PROBE_MARKS = ("generate_204", "gen_204", "connecttest", "ncsi", "hotspot-detect")
 _PROBE_SEEN = {}
 _PROBE_SEEN_LOCK = threading.Lock()
@@ -901,14 +944,19 @@ if __name__ == "__main__":
     try:
         init_common_db()
         start_dns()
-        _res_mod.start_background()
+        for _a, _m in _loaded:
+            if hasattr(_m, "start_background"):
+                try:
+                    _m.start_background()
+                    log.info("模块 %s 后台线程已启动", _a["key"])
+                except Exception:
+                    log.exception("模块 %s 后台线程启动失败", _a["key"])
         log.info("Relay %s · %s · Build %d 门户 http://0.0.0.0:%d （waitress 线程 %d）—— Developer %s",
                  RELAY_VERSION, RELAY_CODENAME, RELAY_BUILD, HTTP_PORT, HTTP_THREADS, DEVELOPER)
-        log.info("DNS 劫持模式：%s（probe=仅探测域名劫持，教师机可正常上网；hijack=全量劫持旧行为；pass=全放行）",
-                 get_dns_mode())
+        log.info("DNS 劫持模式：%s（probe=仅探测域名劫持；hijack=全量劫持；pass=全放行）", get_dns_mode())
         log.info("管理 http://127.0.0.1:%d/admin · 网络诊断 /admin/dns · "
-                 "模块 assistant/resource/remoteclasswork 已挂载 · DNS %s:%d",
-                 HTTP_PORT, DNS_BIND, DNS_PORT)
+                 "模块：%s · DNS %s:%d",
+                 HTTP_PORT, "、".join(a["key"] for a in APPS), DNS_BIND, DNS_PORT)
         serve(app, host="0.0.0.0", port=HTTP_PORT, threads=HTTP_THREADS)
     except Exception:
         log.exception("服务异常退出")

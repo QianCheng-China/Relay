@@ -27,7 +27,7 @@ _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LO_TIMEOUT = 180          # LibreOffice 单文件转换硬超时（秒）
 LO_PROFILE = None         # init 时赋值：独立 profile，杜绝任何交互弹窗
 
-def init(m, ast):
+def init(m, ast=None):
     global M, AST, RES_DB, RES_LOG, INDEX_DIR, CACHE_DIR, LO_PROFILE, log
     M, AST = m, ast
     RES_DB = os.path.join(M.DIR_RES, "resource.db")

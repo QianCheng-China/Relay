@@ -22,7 +22,7 @@ from flask import Blueprint, redirect, request
 
 M = None
 
-def init(m):
+def init(m,ast=None):
     global M, AST_DB, QA_CSV, AST_LOG, log, _gc_started
     M = m
     AST_DB = os.path.join(M.DIR_AST, "assistant.db")
@@ -657,7 +657,7 @@ def admin_assistant():
         with open(QA_CSV, "r", encoding="utf-8-sig") as f:
             allr = list(csv.reader(f))
         head = allr[0] if allr else []
-        rec_rows = allr[-101:] if len(allr) > 100 else allr[1:]
+        rec_rows = allr[-100:] if len(allr) > 100 else allr[1:]
     except OSError:
         pass
     rec = ("<table border='1'><tr>" + "".join("<th>%s</th>" % esc(h) for h in head) + "</tr>")

@@ -43,7 +43,7 @@ class KVError(RuntimeError):
 class TokenDead(KVError):
     pass
 
-def init(m):
+def init(m,ast=None):
     global M, RC_DB, RC_LOG, CACHE_PATH, log, _sync_started
     M = m
     RC_DB = os.path.join(M.DIR_RC, "rc.db")

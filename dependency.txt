@@ -1,1 +1,2 @@
-pip install pymupdf pywin32 winrt
+pip install flask waitress dnslib requests markdown ziamath pymupdf mutagen
+pip install winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Storage.Streams winrt-Windows.Graphics.Imaging
