@@ -1,34 +1,42 @@
-# hostednet_ics.ps1 v2.3 - ICS auto configuration (ASCII-only output)
+# hostednet_ics.ps1 v2.4 - ICS auto configuration (ASCII-only output)
 # ------------------------------------------------------------------
 # Modes:
-#  (no switch)    Configure ICS: uplink (Public) -> hosted adapter (Private)
-#  -StopHotspot   Stop Mobile Hotspot via the WinRT tethering API
-#  -CheckClients  Parse driver max client count (locale-independent)
-#  -DnsTakeover   Point uplink DNS at 127.0.0.1 and verify the hijack chain
-#  -VerifyIcs     Read-only check of sharing bindings + gateway (v2.2+)
+#   (no switch)     Configure ICS: uplink (Public) -> hosted adapter (Private)
+#   -StopHotspot    Stop Mobile Hotspot via the WinRT tethering API
+#   -CheckClients   Parse driver max client count (locale-independent)
+#   -DnsTakeover    Point uplink DNS at 127.0.0.1 and verify the hijack chain
+#   -VerifyIcs      Read-only check of sharing bindings + gateway (v2.2+)
+#
+# v2.4 changes:
+#   - -DnsTakeover now probes a domain Relay hijacks in the DEFAULT probe
+#     DNS mode (connectivitycheck.gstatic.com). The previous probe domain
+#     (baidu.com) is FORWARDED in probe mode and never answers
+#     192.168.137.1, so the old check produced a false alarm on every
+#     run and on every watchdog cycle.
 #
 # v2.3 changes:
-#  - FIX COMException 0x80040201 (EVENT_E_NO_SUBSCRIBERS) at EnableSharing:
-#    that call publishes the change through COM+ events and the ONLY
-#    subscriber is the ICS service (SharedAccess). If the service is
-#    stopped or disabled, the event has no subscriber and the call throws.
-#    Now EventSystem + SharedAccess are brought up first (un-disabled if
-#    needed), EnableSharing retries 3x (sleep, then service restart), and
-#    every retry re-resolves the connection on a FRESH COM object so a
-#    service restart in between cannot invalidate state.
-#  - EnableRebootPersistConnection=1 (per Microsoft KB4054517): the ICS
-#    binding now survives reboots; SharedAccess set to Automatic.
-#  - IDEMPOTENCY: if the correct binding (uplink=Public, hosted=Private)
-#    already exists (e.g. configured manually in ncpa.cpl), the script
-#    KEEPS it and only verifies the gateway. A re-run can no longer undo
-#    a manual configuration. Stale-binding clearing happens only when
-#    the pairing is missing or wrong.
-#  - A failing stale-binding cleanup no longer aborts the run.
-#  - New -VerifyIcs: read-only state dump, safe at any time.
+#   - FIX COMException 0x80040201 (EVENT_E_NO_SUBSCRIBERS) at EnableSharing:
+#     that call publishes the change through COM+ events and the ONLY
+#     subscriber is the ICS service (SharedAccess). If the service is
+#     stopped or disabled, the event has no subscriber and the call throws.
+#     Now EventSystem + SharedAccess are brought up first (un-disabled if
+#     needed), EnableSharing retries 3x (sleep, then service restart), and
+#     every retry re-resolves the connection on a FRESH COM object so a
+#     service restart in between cannot invalidate state.
+#   - EnableRebootPersistConnection=1 (per Microsoft KB4054517): the ICS
+#     binding now survives reboots; SharedAccess set to Automatic.
+#   - IDEMPOTENCY: if the correct binding (uplink=Public, hosted=Private)
+#     already exists (e.g. configured manually in ncpa.cpl), the script
+#     KEEPS it and only verifies the gateway. A re-run can no longer undo
+#     a manual configuration. Stale-binding clearing happens only when
+#     the pairing is missing or wrong.
+#   - A failing stale-binding cleanup no longer aborts the run.
+#   - New -VerifyIcs: read-only state dump, safe at any time.
 #
 # Encoding: this file contains ONLY ASCII characters. Save as ANSI or
 # UTF-8 (identical for pure ASCII). Never save as UTF-16.
 # ------------------------------------------------------------------
+
 param(
     [switch]$StopHotspot,
     [switch]$CheckClients,
@@ -45,9 +53,7 @@ function Get-UplinkName {
     # 2) auto-detect: connected adapter owning the IPv4 default route,
     #    skipping virtual/loopback/bluetooth adapters (incl. the hosted one)
     $skip = 'Hosted|Host Network|Virtual|Bluetooth|Loopback|WAN Miniport|TAP|VMware|Hyper-V|VirtualBox|Wi-Fi Direct'
-    $cands = @(Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip } |
-        Sort-Object ifIndex)
+    $cands = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip } | Sort-Object ifIndex)
     foreach ($a in $cands) {
         $gw = Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
         if ($gw) { return $a.Name }
@@ -82,7 +88,7 @@ function Ensure-IcsServices {
             }
         }
     }
-    if ($ok) { Start-Sleep -Seconds 2 }  # let COM+ event subscribers register
+    if ($ok) { Start-Sleep -Seconds 2 }   # let COM+ event subscribers register
     return $ok
 }
 
@@ -121,10 +127,10 @@ function Enable-SharingRetry {
             Write-Host ("[WARN] EnableSharing on {0} failed (attempt {1}/3, HR=0x{2:X8})." -f $Label, $try, $hr)
             if ($try -lt 3) {
                 if ($try -eq 1) {
-                    Write-Host '       Waiting 5s for COM+ event subscribers to register...'
+                    Write-Host ' Waiting 5s for COM+ event subscribers to register...'
                     Start-Sleep -Seconds 5
                 } else {
-                    Write-Host '       Restarting SharedAccess and retrying...'
+                    Write-Host ' Restarting SharedAccess and retrying...'
                     Restart-Service -Name SharedAccess -Force -ErrorAction SilentlyContinue
                     Start-Sleep -Seconds 5
                 }
@@ -166,7 +172,7 @@ if ($CheckClients) {
     $lines = @(netsh wlan show hostednetwork 2>$null)
     $max = $null
     foreach ($ln in $lines) {
-        if ($ln -match '"') { continue }  # skip SSID line (may end with a digit)
+        if ($ln -match '"') { continue }   # skip SSID line (may end with a digit)
         if ($ln -match ':\s*(\d+)\s*$') { $max = [int]$Matches[1]; break }
     }
     if ($max) {
@@ -193,14 +199,18 @@ if ($DnsTakeover) {
     Write-Host ("Uplink adapter resolved to: {0}" -f $up)
     netsh interface ip set dns name="$up" static 127.0.0.1 | Out-Null
     Start-Sleep -Seconds 2
-    $answer = (nslookup baidu.com 127.0.0.1 2>$null | Out-String)
+    # Probe a domain Relay hijacks in the DEFAULT probe DNS mode.
+    # (baidu.com is FORWARDED in probe mode and never answers 192.168.137.1 -
+    #  the old check produced a false alarm on every run and watchdog cycle.)
+    $answer = (nslookup connectivitycheck.gstatic.com 127.0.0.1 2>$null | Out-String)
     if ($answer -match '192\.168\.137\.1') {
-        Write-Host 'DNS hijack chain verified: baidu.com answers 192.168.137.1.'
+        Write-Host 'DNS hijack chain verified: probe domain answers 192.168.137.1.'
         exit 0
     } else {
         Write-Host '[WARN] DNS hijack probe failed.'
         Write-Host ' Check port 53 occupancy: netstat -ano | findstr ":53"'
         Write-Host ' Confirm relay.log shows: DNS (UDP) 127.0.0.1:53 started.'
+        Write-Host ' (In DNS pass mode nothing is hijacked - switch to probe/hijack to test.)'
         exit 1
     }
 }
@@ -211,7 +221,8 @@ if ($VerifyIcs) {
     if (-not $svc -or $svc.Status -ne 'Running') {
         Write-Host '[WARN] SharedAccess (ICS) service is not running - reported state may be empty or stale.'
     }
-    try { $share = New-Object -ComObject HNetCfg.HNetShare } catch {
+    try { $share = New-Object -ComObject HNetCfg.HNetShare }
+    catch {
         Write-Host "[ERROR] Cannot create the ICS COM object: $($_.Exception.Message)"
         exit 1
     }
@@ -234,21 +245,21 @@ if ($VerifyIcs) {
         $mark = ''
         if ($p.Name -eq $uplinkName) { $mark = ' [uplink]' }
         if ($p.DeviceName -match $hostedRe) { $mark = "$mark [hosted]" }
-        Write-Host (" {0} | {1} | {2}{3}" -f $p.Name, $p.DeviceName, $state, $mark)
+        Write-Host ("  {0} | {1} | {2}{3}" -f $p.Name, $p.DeviceName, $state, $mark)
         if ($p.Name -eq $uplinkName -and $state -eq 'shared PUBLIC') { $pubOk = $true }
         if ($p.DeviceName -match $hostedRe -and $state -eq 'shared PRIVATE') { $privOk = $true }
     }
     $ip = Get-NetIPAddress -IPAddress 192.168.137.1 -ErrorAction SilentlyContinue
     Write-Host ''
-    Write-Host (" Uplink PUBLIC sharing  : {0}" -f $(if ($pubOk) { 'OK' } else { 'NOT SET' }))
-    Write-Host (" Hosted PRIVATE sharing : {0}" -f $(if ($privOk) { 'OK' } else { 'NOT SET' }))
-    Write-Host (" Gateway 192.168.137.1  : {0}" -f $(if ($ip) { 'present on ' + $ip.InterfaceAlias } else { 'missing' }))
+    Write-Host ("  Uplink PUBLIC sharing   : {0}" -f $(if ($pubOk) { 'OK' } else { 'NOT SET' }))
+    Write-Host ("  Hosted PRIVATE sharing  : {0}" -f $(if ($privOk) { 'OK' } else { 'NOT SET' }))
+    Write-Host ("  Gateway 192.168.137.1   : {0}" -f $(if ($ip) { 'present on ' + $ip.InterfaceAlias } else { 'missing' }))
     if ($pubOk -and $privOk -and $ip) {
-        Write-Host ' [OK] ICS binding complete. Tablets should reach http://192.168.137.1/'
+        Write-Host '  [OK] ICS binding complete. Tablets should reach http://192.168.137.1/'
         exit 0
     }
-    Write-Host ' [FAIL] ICS binding incomplete. Configure in ncpa.cpl (see guide)'
-    Write-Host '        or re-run hostednet.bat (full config mode).'
+    Write-Host '  [FAIL] ICS binding incomplete. Configure in ncpa.cpl (see guide)'
+    Write-Host '  or re-run hostednet.bat (full config mode).'
     exit 1
 }
 
@@ -256,10 +267,10 @@ if ($VerifyIcs) {
 Write-Host '[Step A] Bringing up the ICS service stack (0x80040201 fix)...'
 if (-not (Ensure-IcsServices)) {
     Write-Host '[ERROR] The ICS service (SharedAccess) cannot be brought up.'
-    Write-Host '        Diagnose with:  sc query SharedAccess   /   sc qc SharedAccess'
-    Write-Host '        If disabled by group policy or a cleaner tool, re-enable it,'
-    Write-Host '        or enable sharing once in ncpa.cpl (the GUI starts the service'
-    Write-Host '        itself) and verify with: hostednet_ics.ps1 -VerifyIcs'
+    Write-Host '  Diagnose with: sc query SharedAccess / sc qc SharedAccess'
+    Write-Host '  If disabled by group policy or a cleaner tool, re-enable it,'
+    Write-Host '  or enable sharing once in ncpa.cpl (the GUI starts the service'
+    Write-Host '  itself) and verify with: hostednet_ics.ps1 -VerifyIcs'
     exit 1
 }
 
@@ -276,7 +287,8 @@ Write-Host ("Uplink adapter: {0}" -f $uplinkName)
 $localizedHosted = [regex]::Escape((-join ([char]0x627F, [char]0x8F7D)))
 $hostedRe = 'Hosted|Host Network|' + $localizedHosted
 
-try { $share = New-Object -ComObject HNetCfg.HNetShare } catch {
+try { $share = New-Object -ComObject HNetCfg.HNetShare }
+catch {
     Write-Host "[ERROR] Cannot create the ICS COM object: $($_.Exception.Message)"
     exit 1
 }
@@ -284,7 +296,7 @@ try { $share = New-Object -ComObject HNetCfg.HNetShare } catch {
 Write-Host '--- Current network connections ---'
 foreach ($c in $share.EnumEveryConnection()) {
     $p = $share.NetConnectionProps($c)
-    Write-Host (" Name: {0} | Device: {1}" -f $p.Name, $p.DeviceName)
+    Write-Host ("  Name: {0} | Device: {1}" -f $p.Name, $p.DeviceName)
 }
 
 # Sanity: both endpoints must exist before touching anything.
@@ -297,7 +309,7 @@ foreach ($c in $share.EnumEveryConnection()) {
 }
 if (-not $foundUplink) {
     Write-Host ("[ERROR] Uplink adapter not found: {0}" -f $uplinkName)
-    Write-Host ' Check the exact adapter name in ncpa.cpl, or set RELAY_UPLINK.'
+    Write-Host '  Check the exact adapter name in ncpa.cpl, or set RELAY_UPLINK.'
     exit 1
 }
 if (-not $hostedAlias) {
@@ -324,7 +336,7 @@ foreach ($c in $share.EnumEveryConnection()) {
 }
 if ($pubSet -and $privSet) {
     Write-Host '[OK] Correct ICS binding already present (uplink=Public, hosted=Private).'
-    Write-Host '     Keeping it untouched and verifying the gateway only.'
+    Write-Host ' Keeping it untouched and verifying the gateway only.'
     Start-Sleep -Seconds 2
     $ip = Get-NetIPAddress -IPAddress 192.168.137.1 -ErrorAction SilentlyContinue
     if ($ip) {
@@ -343,9 +355,7 @@ foreach ($c in $share.EnumEveryConnection()) {
             $cfg.DisableSharing()
             Write-Host 'Cleared one stale sharing binding.'
         }
-    } catch {
-        Write-Host '[WARN] One stale sharing binding could not be cleared (ignored).'
-    }
+    } catch { Write-Host '[WARN] One stale sharing binding could not be cleared (ignored).' }
 }
 
 Set-NetIPInterface -InterfaceAlias $hostedAlias -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
@@ -353,16 +363,16 @@ Set-DnsClientServerAddress -InterfaceAlias $hostedAlias -ResetServerAddresses -E
 
 if (-not (Enable-SharingRetry -Mode 0 -Label $uplinkName)) {
     Write-Host '[ERROR] Could not enable PUBLIC sharing on the uplink.'
-    Write-Host ' Likely causes:'
-    Write-Host ' - SharedAccess disabled by group policy or cleaner tools (sc qc SharedAccess)'
-    Write-Host ' - COM+ Event System (EventSystem) stopped'
-    Write-Host ' Fallback: enable sharing once in ncpa.cpl (the GUI starts the service),'
-    Write-Host ' then verify with: powershell -File hostednet_ics.ps1 -VerifyIcs'
+    Write-Host '  Likely causes:'
+    Write-Host '  - SharedAccess disabled by group policy or cleaner tools (sc qc SharedAccess)'
+    Write-Host '  - COM+ Event System (EventSystem) stopped'
+    Write-Host '  Fallback: enable sharing once in ncpa.cpl (the GUI starts the service),'
+    Write-Host '  then verify with: powershell -File hostednet_ics.ps1 -VerifyIcs'
     exit 1
 }
 if (-not (Enable-SharingRetry -Mode 1 -Label $hostedAlias)) {
     Write-Host '[ERROR] Could not enable PRIVATE sharing on the hosted adapter.'
-    Write-Host ' Make sure the hosted network is started, then run this script again.'
+    Write-Host '  Make sure the hosted network is started, then run this script again.'
     exit 1
 }
 

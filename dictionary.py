@@ -5,8 +5,12 @@ Relay Dictionary 模块：mobi/prc 词典查询
 数据：data/dictionary/{dict.db, dict.log, dictsource/, last_extract_*.html}
       词典源文件(.mobi/.prc/.azw)由教师放入 dictsource 目录，管理页导入。
 管线（基于四份真实样例适配，零第三方依赖——自带 MOBI/PalmDOC 解析器）：
-  BOOKMOBI 解析（record0：压缩类型[0:2]/文本记录数[4:6]/编码[24:28]/extra flags[258:260]）
-  → 逐记录剥 trailing entries（先 multibyte overlap 再逐标志位 varint，KindleUnpack 规范）
+  BOOKMOBI 解析（record0 偏移与 KindleUnpack/DeDRM 源码一致：
+      压缩类型[0:2] / 文本记录数[8:10] / 'MOBI'[16:20] / 头长[20:24] /
+      编码[28:32] / 文件版本[36:40] / 门控版本[104:108] / extra flags[242:244]）
+  → 逐记录剥 trailing entries（顺序与 DeDRM/KindleUnpack 一致：
+      记录布局 = [正文][multibyte][trailing entries(在最末尾)]，
+      先从最末尾向前逐标志位剥 trailing varint，最后剥 multibyte）
   → PalmDOC 解压 → 拼接正文 → 剥 head/guide/frameset/pagebreak
   → 三级自适应词条切分：
       ① idx:entry/idx:orth（标准 Kindle 词典）
@@ -14,8 +18,9 @@ Relay Dictionary 模块：mobi/prc 词典查询
       ③ <hr/> 分段 + 段首 <b> 词条头（现代汉英词典式）
   → 清洗（script/style/img/iframe 剔除、a/filepos 剥壳留字）、伪词条过滤
   → SQLite 入库。同一头词多条（多音字）全部保留。
-查询：精确 → 前缀 → 包含 三级合并（互相排他去重），最多 20 条；首 3 条展开，其余 <details> 折叠。
-Relay Hold v2：查询词在 ?q= 由全局 URL 心跳恢复；滚动由全局滚动心跳恢复；查询历史按用户存 10 条。
+查询：精确 → 前缀 → 包含 三级合并，最多 20 条；首 3 条展开，其余 <details> 折叠。
+Relay Hold v2：查询词在 ?q= 由全局 URL 心跳恢复；滚动由全局滚动心跳恢复；
+      查询历史按用户存 10 条。
 """
 import html as _htmlmod
 import os, re, sqlite3, threading, time
@@ -95,7 +100,9 @@ def _palmdec(data):
     return bytes(out)
 
 def _trailing_entry_size(data, size):
-    """从 data[size-1] 起向前读 varint（KindleUnpack 规范：高位字节在前遇到即止）。"""
+    """从 data[size-1] 起向前读 varint（与 DeDRM getSizeOfTrailingDataEntry 等价：
+    末字节贡献最低 7 位，逐字节向前、位权递增；遇到置位 0x80 的字节即止，
+    该字节的低 7 位计入结果）。"""
     bitpos, result = 0, 0
     while size > 0:
         v = data[size - 1]
@@ -107,27 +114,34 @@ def _trailing_entry_size(data, size):
     return result
 
 def _strip_extra(rec, flags):
-    """剥记录尾部 extra data：先 multibyte overlap（bit0），再按 flags>>1 逐位剥 trailing entry。
-    词典的 filepos 索引就在 trailing entries 中，必须在解压前剥离。"""
+    """剥记录尾部 extra data（顺序与 DeDRM/KindleUnpack 完全一致）。
+    记录布局 = [正文][multibyte overlap][trailing entries(在最末尾)]：
+    先从记录最末尾向前逐个置位标志剥 trailing entries（每个的 backward-varint
+    尺寸在该条目末尾），最后剥 multibyte（尺寸字节位于 trailing 块之前一位，
+    (值&3)+1 字节）。"""
     if not rec:
         return rec
-    off = 0
-    if flags & 1:
-        off = (rec[len(rec) - 1] & 3) + 1
+    n = 0
     f = flags >> 1
     while f:
         if f & 1:
-            off += _trailing_entry_size(rec, len(rec) - off)
+            n += _trailing_entry_size(rec, len(rec) - n)
+            if n >= len(rec):
+                return rec          # 防御：异常尺寸时不剥，保底不崩溃
         f >>= 1
-    if off and off < len(rec):
-        return rec[:len(rec) - off]
+    if flags & 1 and n < len(rec):
+        n += (rec[len(rec) - n - 1] & 3) + 1
+    if 0 < n < len(rec):
+        return rec[:len(rec) - n]
     return rec
 
 def extract_text(path):
-    """返回 MOBI 正文 HTML 字符串（支持未压缩与 PalmDOC 压缩；HUFF/CDIC 类 AZW3 不支持）。
-    record0 字段偏移均为“record0 起始”绝对偏移（KindleUnpack 布局）：
-      [0:2] 压缩类型 · [8:10] 文本记录数 · [16:20] 'MOBI' 魔数 · [28:32] 文本编码
-      [36:40] 版本 · [242:244](0xF2) extra data flags（版本 ≥5 才存在）"""
+    """返回 MOBI 正文 HTML 字符串（支持未压缩与 PalmDOC 压缩；HUFF/CDIC 不支持）。
+    偏移均以 record0 起始为基准（与 KindleUnpack/DeDRM 源码一致）：
+      PalmDOC 头：压缩类型[0:2] · 文本记录数[8:10]（[10:12] 是记录大小 4096，勿混）
+      MOBI 头：'MOBI'[16:20] · 头长[20:24] · 编码[28:32] · 文件版本[36:40]
+      门控版本[104:108]（最小版本字段，与文件版本是两个不同字段）
+      extra data flags[242:244]（头长 >= 0xE4 且门控版本 >= 5 时才存在）"""
     if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
         raise ValueError("文件超过 %dMB，不予处理" % MAX_FILE_MB)
     with open(path, "rb") as f:
@@ -137,15 +151,14 @@ def extract_text(path):
     recs = _pdb_records(data)
     if not recs or recs[0][1] <= recs[0][0]:
         raise ValueError("PDB 记录表异常（文件可能损坏）")
-    maxn = (len(data) - 78) // 8
     num = int.from_bytes(data[76:78], "big")
-    if num > maxn:
+    if num > (len(data) - 78) // 8:
         raise ValueError("PDB 记录数异常（文件可能损坏）")
     r0 = data[recs[0][0]:recs[0][1]]
     if len(r0) < 40:
         raise ValueError("record0 过短，文件可能损坏")
     compression = int.from_bytes(r0[0:2], "big")
-    text_count = int.from_bytes(r0[8:10], "big")       # PalmDOC 记录数
+    text_count = int.from_bytes(r0[8:10], "big")       # PalmDOC 头：文本记录数
     encoding = int.from_bytes(r0[28:32], "big")        # 65001=UTF-8 / 1252=CP1252
     if compression == 17480:
         raise ValueError("HUFF/CDIC 压缩（AZW3/KF8）暂不支持，请使用 .mobi/.prc 源文件")
@@ -154,8 +167,9 @@ def extract_text(path):
     codec = "utf-8" if encoding in (65001, 0) else "cp1252"
     flags = 0
     if len(r0) >= 244 and r0[16:20] == b"MOBI":
-        ver = int.from_bytes(r0[36:40], "big")
-        if ver >= 5:
+        mobi_length = int.from_bytes(r0[20:24], "big")
+        mobi_version = int.from_bytes(r0[104:108], "big") if len(r0) >= 108 else 0
+        if mobi_length >= 0xE4 and mobi_version >= 5:
             flags = int.from_bytes(r0[242:244], "big") & 0xFFFF
     chunks = []
     for idx in range(1, min(text_count, len(recs) - 1) + 1):
@@ -163,7 +177,7 @@ def extract_text(path):
         rec = data[s:e]
         if not rec:
             continue
-        rec = _strip_extra(rec, flags)     # 先剥 trailing entries（含词典 filepos）
+        rec = _strip_extra(rec, flags)     # 规范顺序：trailing（末尾）在前，multibyte 在后
         if compression == 2:
             rec = _palmdec(rec)
         chunks.append(rec.decode(codec, "ignore"))
@@ -171,7 +185,6 @@ def extract_text(path):
     if len(html.strip()) < 200:
         raise ValueError("解压后正文过短，文件可能损坏")
     return html
-
 
 # ================= 清洗与词条切分 =================
 _TAG_RE = re.compile(r"<[^>]+>")
