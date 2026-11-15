@@ -261,6 +261,9 @@ def current_user():
     user, sdev, adev = rows[0]
     return user if (sdev == dev and adev == dev) else None
 
+# ---------- App ----------
+app = Flask(__name__)
+
 # ---------- Relay Hold v2：功能页 + 完整 URL + 滚动位置 ----------
 def hold_page(key):
     u = current_user()
@@ -428,8 +431,6 @@ def login_page(err=""):
             "<p class='tip'>一个账号仅允许与一台设备绑定</p>"
             + REOPEN_TIP + FOOTER + "</body></html>")
 
-# ---------- App ----------
-app = Flask(__name__)
 
 @app.after_request
 def finish(resp):
