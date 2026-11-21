@@ -9,8 +9,6 @@
     {"key": "dictionary", "module": "dictionary", "title": "Dictionary", "desc": "查询词典",
      "admin_url": "/admin/dictionary", "admin_desc": "mobi 词典导入与管理"},
     {"key": "weather", "module": "weather", "title": "Weather", "desc": "查看天气变化与天气预报",
-     "admin_url": "/admin/weather", "admin_desc": "城市配置 · 天数与刷新间隔 · 拉取测试"},
-    {"key": "music", "module": "music", "title": "Music", "desc": "播放音乐与听力材料",
-     "admin_url": "/admin/music", "admin_desc": "音乐目录 · 扫描 · 统计 · 播放记录维护"}
+     "admin_url": "/admin/weather", "admin_desc": "城市配置 · 天数与刷新间隔 · 拉取测试"}
   ]
 }

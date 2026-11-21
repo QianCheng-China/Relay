@@ -2,17 +2,18 @@
 """
 Relay Assistant 模块（原 Canary0.1.5 AI 问答全量迁移）
 数据：data/assistant/{assistant.db, assistant.log, relay_qa.csv}
+
+Relay 3.0 · CTU 变更：
+ - 修复 _gc_started 未在模块级初始化（init 首次读取即 NameError → 模块被
+   跳过 → /assistant 全部 404），并删除原 if 块之后的无条件误复位。
+   其余逻辑与 Build 43 一致。
+
 Build 40 (v1.1) 变更：
-- 问答状态落库（jobs 表）：服务重启/平板闪退双免疫；/assistant 检测未完成请求自动跳 /result；
-  超时自动解锁；后台 GC 清理过期记录。内存 _results/_busy 退役。
-- LaTeX 渲染排查增强（问题9）：失败不再静默，完整 traceback 入 assistant.log；
-  新增管理页"渲染自检"；\\( \\) / \\[ \\] / \\boxed 归一化。
-  ⚠ 排查注释：渲染失效的头号嫌疑是"Relay 服务运行的 python.exe 与 pip 安装 ziamath
-  的解释器不一致"（与 resource.log 中 pymupdf 缺失同款先例）。验证方法：
-  1) sc qc Relay 查看 BINARY_PATH_NAME 中的 python 路径；
-  2) 用该解释器执行："<python路径>" -c "import ziamath;print(ziamath.__version__)"
-  3) 报 ImportError → 用该解释器 pip install ziamath；能导入仍失败 → 管理页自检看 traceback。
-- Relay Hold v2：草稿 0.8s 防抖保留；页面位置由主程序全局心跳接管。
+ - 问答状态落库（jobs 表）：服务重启/平板闪退双免疫；/assistant 检测未完成请求
+   自动跳 /result；超时自动解锁；后台 GC 清理过期记录。
+ - LaTeX 渲染排查增强（问题9）：失败不再静默，完整 traceback 入 assistant.log；
+   新增管理页"渲染自检"；\( \) / \[ \] / \boxed 归一化。
+ - Relay Hold v2：草稿 0.8s 防抖保留；页面位置由主程序全局心跳接管。
 """
 import csv, os, re, threading, time
 from datetime import datetime
@@ -21,8 +22,11 @@ import requests as http
 from flask import Blueprint, redirect, request
 
 M = None
+AST_DB = QA_CSV = AST_LOG = None
+log = None
+_gc_started = False    # CTU 修复:必须在模块级初始化(原代码缺失)
 
-def init(m,ast=None):
+def init(m, ast=None):
     global M, AST_DB, QA_CSV, AST_LOG, log, _gc_started
     M = m
     AST_DB = os.path.join(M.DIR_AST, "assistant.db")
@@ -30,11 +34,11 @@ def init(m,ast=None):
     AST_LOG = os.path.join(M.DIR_AST, "assistant.log")
     log = M._mklog("relay.assistant", AST_LOG)
     init_db()
+    # CTU 修复:GC 线程只启动一次,不再误复位
     if not _gc_started:
         _gc_started = True
         threading.Thread(target=_jobs_gc, daemon=True).start()
 
-_gc_started = False
 bp = Blueprint("assistant", __name__)
 
 try:
@@ -110,7 +114,8 @@ def _enter_queue():
 def _q_grant():
     global _waiting, _active
     with _q_lock:
-        _waiting -= 1; _active += 1
+        _waiting -= 1
+        _active += 1
 
 def _q_abandon():
     global _waiting, _paused
@@ -173,7 +178,7 @@ def _render_latex_svg(expr):
     # 头号嫌疑：Relay 服务实际运行的 python.exe 与 pip 安装 ziamath 的解释器不是
     # 同一个（与 resource.log 中 pymupdf 缺失同款先例，已证实该模式会发生）。
     # 验证：sc qc Relay 查看服务所用 python 路径 → 用它执行
-    #   "<python路径>" -c "import ziamath;print(ziamath.__version__)"
+    # "<python路径>" -c "import ziamath;print(ziamath.__version__)"
     # 若 ImportError：用该解释器 pip install ziamath 即可修复。
     # 亦可到 Assistant 管理页点"公式渲染自检"现场查看版本与 traceback。
     # ────────────────────────────────────────────────────────────────────
@@ -200,10 +205,12 @@ def md_to_html(text):
         return ""
     text = _norm_math(text.strip())
     snippets = []
+
     def _stash(m, display):
         idx = len(snippets)
         snippets.append((m.group(1).strip(), display))
         return _MATH_TOKEN.format(idx)
+
     text = _MATH_BLOCK_RE.sub(lambda m: _stash(m, True), text)
     text = _MATH_INLINE_RE.sub(lambda m: _stash(m, False), text)
     text = esc(text)
@@ -230,14 +237,15 @@ def _render_selftest():
     out = []
     try:
         import ziamath
-        out.append("ziamath 版本：%s（模块位置：%s）" % (getattr(ziamath, "__version__", "?"),
-                                                  getattr(ziamath, "__file__", "?")))
+        out.append("ziamath 版本：%s（模块位置：%s）"
+                   % (getattr(ziamath, "__version__", "?"),
+                      getattr(ziamath, "__file__", "?")))
     except Exception as e:
         out.append("ziamath 导入失败：%r" % (e,))
         out.append("→ 排查：Relay 服务运行的 python.exe 可能与 pip 安装目标不一致。")
-        out.append("   步骤：sc qc Relay 查看 BINARY_PATH_NAME 中的 python 路径，然后用该解释器执行：")
-        out.append('   "<该python路径>" -c "import ziamath;print(ziamath.__version__)"')
-        out.append("   报 ImportError 则用该解释器执行 pip install ziamath")
+        out.append(" 步骤：sc qc Relay 查看 BINARY_PATH_NAME 中的 python 路径，然后用该解释器执行：")
+        out.append(' "<该python路径>" -c "import ziamath;print(ziamath.__version__)"')
+        out.append(" 报 ImportError 则用该解释器执行 pip install ziamath")
         return out
     try:
         svg = _render_latex_svg("x^2+\\frac{1}{2}")
@@ -259,8 +267,8 @@ def _qa_log(user, dev, q, ans, tokens, allow_web):
             w = csv.writer(f)
             if new:
                 w.writerow(["时间", "账号", "设备", "提问", "回答", "tokens", "联网"])
-            w.writerow([datetime.now().isoformat(timespec="seconds"), user, dev, q, ans,
-                        tokens, "是" if allow_web else "否"])
+            w.writerow([datetime.now().isoformat(timespec="seconds"), user, dev,
+                        q, ans, tokens, "是" if allow_web else "否"])
 
 def _finalize(user, dev, qtext, answer, usage, allow_web, t0):
     try:
@@ -270,8 +278,9 @@ def _finalize(user, dev, qtext, answer, usage, allow_web, t0):
         tokens = usage or _estimate_tokens(qtext, answer)
         exact = "API" if usage else "估算"
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        M.dbq(M.COMMON_DB, "UPDATE accounts SET last_seen=?, last_query=?, tokens_total=tokens_total+? "
-                           "WHERE username=?", (now, qtext[:80], tokens, user))
+        M.dbq(M.COMMON_DB, "UPDATE accounts SET last_seen=?, last_query=?, "
+                           "tokens_total=tokens_total+? WHERE username=?",
+              (now, qtext[:80], tokens, user))
         _qa_log(user, dev, qtext, ans, tokens, allow_web)
         dur = max(1, int(time.time() - t0))
         return "回答长度 %d · 折算 tokens %d（%s）· 用时 %d s" % (len(ans), tokens, exact, dur)
@@ -302,7 +311,8 @@ def _jobs_gc():
     while True:
         time.sleep(120)
         try:
-            M.dbq(AST_DB, "DELETE FROM jobs WHERE state='done' AND ts < ?", (time.time() - RESULT_TTL,))
+            M.dbq(AST_DB, "DELETE FROM jobs WHERE state='done' AND ts < ?",
+                  (time.time() - RESULT_TTL,))
         except Exception:
             pass
 
@@ -402,7 +412,8 @@ def ctx_load(user, rounds):
     if rounds <= 0 or not user:
         return []
     try:
-        rows = M.dbq(AST_DB, "SELECT q,a FROM ctx WHERE user=? ORDER BY rowid DESC LIMIT ?", (user, rounds))
+        rows = M.dbq(AST_DB, "SELECT q,a FROM ctx WHERE user=? ORDER BY rowid DESC LIMIT ?",
+                     (user, rounds))
     except Exception:
         return []
     turns, budget = [], CTX_CHAR_BUDGET
@@ -435,17 +446,17 @@ def web_checkbox():
     return ("<label class='tip'><input type='checkbox' name='web' value='1'>联网搜索</label>")
 
 _DRAFT_JS = ("<script>(function(){"
- "var ta=document.getElementById('q');if(!ta)return;"
- "var timer=null,submitting=false;"
- "function save(){var x=new XMLHttpRequest();"
- "x.open('POST','/hold/draft',true);"
- "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
- "x.send('q='+encodeURIComponent(ta.value));}"
- "ta.addEventListener('input',function(){if(timer)clearTimeout(timer);timer=setTimeout(save,800);});"
- "var f=document.getElementById('askform');"
- "if(f)f.addEventListener('submit',function(){submitting=true;});"
- "window.addEventListener('pagehide',function(){if(!submitting)save();});"
- "})();</script>")
+             "var ta=document.getElementById('q');if(!ta)return;"
+             "var timer=null,submitting=false;"
+             "function save(){var x=new XMLHttpRequest();"
+             "x.open('POST','/hold/draft',true);"
+             "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
+             "x.send('q='+encodeURIComponent(ta.value));}"
+             "ta.addEventListener('input',function(){if(timer)clearTimeout(timer);timer=setTimeout(save,800);});"
+             "var f=document.getElementById('askform');"
+             "if(f)f.addEventListener('submit',function(){submitting=true;});"
+             "window.addEventListener('pagehide',function(){if(!submitting)save();});"
+             "})();</script>")
 
 def _ctx_html(user):
     rounds = ctx_rounds()
@@ -496,8 +507,10 @@ def qa_page(user, ans_html=None, qtext="", note=None, ta_text=None, show_busy=Tr
             "<form method='post' action='/ask' id='askform'>"
             f"<textarea name='q' id='q' rows='3' "
             f"placeholder='输入问题，轻触发送以询问AI（输入自动保存草稿）'>{ta}</textarea>"
-            + web_checkbox() + "<button type='submit'>发 送</button></form>"
-            + btn_last + f"<p class='queue'>{esc(qline)}</p>{busy_line}{qh}{ah}{nh}"
+            + web_checkbox() +
+            "<button type='submit'>发 送</button></form>"
+            + btn_last +
+            f"<p class='queue'>{esc(qline)}</p>{busy_line}{qh}{ah}{nh}"
             + ctxhtml + M.REOPEN_TIP + M.FOOTER + M.hold_loc_js(user) + _DRAFT_JS
             + "</body></html>")
 
@@ -527,14 +540,14 @@ def ask():
         return redirect("/result", 303) if j else redirect("/assistant", 303)
     j = _job_get(u)
     if j and j["state"] == "wait" and (time.time() - j["ts"] < BUSY_STALE):
-        return redirect("/result", 303)   # 单飞：已有进行中的请求
+        return redirect("/result", 303)  # 单飞：已有进行中的请求
     if not _enter_queue():
         w, a, _ = _breaker_state()
         log.warning("熔断拒绝 user=%s 排队=%d", u, w)
         return qa_page(u, ans_html=("<p class='err'>系统繁忙：当前排队 %d，正在回答 %d/%d，"
-                      "已暂停接受新请求，请稍后重新发送。</p>" % (w, a, AI_CONCURRENCY)),
-                      qtext=qtext, ta_text=qtext)
-    hold_draft_clear(u)   # Relay Hold：进入队列，草稿使命完成
+                                    "已暂停接受新请求，请稍后重新发送。</p>" % (w, a, AI_CONCURRENCY)),
+                       qtext=qtext, ta_text=qtext)
+    hold_draft_clear(u)  # Relay Hold：进入队列，草稿使命完成
     dev = M.device_id()
     allow_web = (src.get("web") == "1") and setting_get("websearch", "1") == "1"
     _job_set(u, "wait", qtext)
@@ -575,10 +588,11 @@ def result():
             _job_set(u, "done", j["qtext"], err="本次请求超时未完成，请重新发送。")
             j = _job_get(u)
         else:
-            # 等待页轮询：不写 Hold 页码（避免 3 秒一次的 DB 写；全局心跳除外）
+            # 等待页轮询：不写 Hold 页码（避免频繁 DB 写；全局心跳除外）
             return qa_page(u, qtext=j["qtext"], show_busy=False,
                            extra_head=("<meta http-equiv='refresh' content='%d;url=/result'>"
-                                       % REFRESH_SECONDS), show_ctx=False, waiting=True)
+                                       % REFRESH_SECONDS),
+                           show_ctx=False, waiting=True)
     M.hold_page("assistant")
     if j.get("err"):
         return qa_page(u, ans_html="<p class='err'>" + esc(j["err"]) + "</p>", qtext=j["qtext"])
@@ -629,7 +643,8 @@ def admin_assistant():
     ws_state = "开" if setting_get("websearch", "1" if AI_WEBSEARCH_DEFAULT else "0") == "1" else "关"
     cr = ctx_rounds()
     try:
-        cnt, tot = M.dbq(M.COMMON_DB, "SELECT COUNT(*), IFNULL(SUM(tokens_total),0) FROM accounts")[0]
+        cnt, tot = M.dbq(M.COMMON_DB,
+                         "SELECT COUNT(*), IFNULL(SUM(tokens_total),0) FROM accounts")[0]
     except Exception:
         cnt, tot = 0, 0
     acc_rows = ""
@@ -648,7 +663,8 @@ def admin_assistant():
     try:
         for u2, t in M.dbq(M.COMMON_DB, "SELECT username, tokens_total FROM accounts "
                                         "WHERE tokens_total>0 ORDER BY tokens_total DESC LIMIT 10"):
-            top += "<tr><td>%s</td><td style='text-align:right'>%s</td></tr>" % (esc(u2), f"{int(t or 0):,}")
+            top += "<tr><td>%s</td><td style='text-align:right'>%s</td></tr>" \
+                   % (esc(u2), f"{int(t or 0):,}")
     except Exception:
         pass
     rec_rows = []
@@ -671,37 +687,44 @@ def admin_assistant():
     body = (M.back_btn("/admin") + ("<p class='err'>" + esc(msg) + "</p>" if msg else "")
             + f"<p>账号数 <b>{cnt}</b> · 累计 tokens <b>{int(tot):,}</b></p>"
             + "<h4>账号数据（Token 用量 / 最近提问）</h4>"
-            + "<table border='1'><tr><th>账号</th><th>累计tokens</th><th>最近提问</th><th>操作</th></tr>"
-            + (acc_rows or "<tr><td colspan='4' class='tip'>暂无账号</td></tr>") + "</table>"
+            + "<table border='1'><tr><th>账号</th><th>累计tokens</th>"
+              "<th>最近提问</th><th>操作</th></tr>"
+            + (acc_rows or "<tr><td colspan='4' class='tip'>暂无账号</td></tr>")
+            + "</table>"
             + "<form method='post' action='/admin/assistant'>"
-            "<input type='hidden' name='act' value='zerotok_all'>"
-            "<button class='mini'>全部账号 Token 清零</button></form>"
+              "<input type='hidden' name='act' value='zerotok_all'>"
+              "<button class='mini'>全部账号 Token 清零</button></form>"
             + "<h4>Token 用量 Top10</h4><table border='1'><tr><th>账号</th><th>tokens</th></tr>"
-            + (top or "<tr><td colspan='2' class='tip'>暂无数据</td></tr>") + "</table>"
+            + (top or "<tr><td colspan='2' class='tip'>暂无数据</td></tr>")
+            + "</table>"
             + "<h4>公式渲染自检（问题9 排查工具）</h4>"
-            "<form method='post' action='/admin/assistant'>"
-            "<input type='hidden' name='act' value='rendertest'>"
-            "<button class='mini'>立即自检（ziamath 版本 + 现场渲染）</button></form>"
-            "<p class='tip'>若自检失败：先用 sc qc Relay 确认服务所用 python.exe，"
-            "再用该解释器安装 ziamath（详见自检输出与 assistant.py 头部注释）</p>"
+              "<form method='post' action='/admin/assistant'>"
+              "<input type='hidden' name='act' value='rendertest'>"
+              "<button class='mini'>立即自检（ziamath 版本 + 现场渲染）</button></form>"
+              "<p class='tip'>若自检失败：先用 sc qc Relay 确认服务所用 python.exe，"
+              "再用该解释器安装 ziamath（详见自检输出与 assistant.py 头部注释）</p>"
             + test_html
             + "<p>AI 联网搜索选项：当前【" + ws_state + "】"
-            "<form method='post' action='/admin/assistant' style='display:inline'>"
-            "<input type='hidden' name='act' value='webtoggle'>"
-            "<button class='mini'>切换</button></form></p>"
+              "<form method='post' action='/admin/assistant' style='display:inline'>"
+              "<input type='hidden' name='act' value='webtoggle'>"
+              "<button class='mini'>切换</button></form></p>"
             + "<p>对话上下文：当前保留 <b>" + str(cr) + "</b> 轮（0=关闭）"
-            "<form method='post' action='/admin/assistant' style='display:inline'>"
-            "<input type='hidden' name='act' value='ctxset'>"
-            f"<input name='ctx' type='number' min='0' max='{CTX_ROUNDS_MAX}' value='{cr}' style='width:70px'>"
-            "<button class='mini'>保存轮数</button></form> "
-            "<form method='post' action='/admin/assistant' style='display:inline'>"
-            "<input type='hidden' name='act' value='ctxclear_all'>"
-            "<button class='mini'>清空全部用户上下文</button></form></p>"
-            + "<p>清除单用户上下文：<form method='post' action='/admin/assistant' style='display:inline'>"
-            "<input type='hidden' name='act' value='ctxclear'>"
-            "<input name='u' placeholder='账号' style='width:160px'>"
-            "<button class='mini'>清除</button></form></p>"
-            + "<h4>询问记录</h4>" + rec
-            + "<p class='tip'><a href='/admin'>返回管理中心</a></p>" + M.FOOTER)
-    return (f"<!doctype html><html><head><meta charset='utf-8'>{M.STYLE}<title>Assistant 管理</title>"
-            f"</head><body><h3>Assistant 管理</h3>{body}</body></html>")
+              "<form method='post' action='/admin/assistant' style='display:inline'>"
+              "<input type='hidden' name='act' value='ctxset'>"
+              f"<input name='ctx' type='number' min='0' max='{CTX_ROUNDS_MAX}' value='{cr}' "
+              "style='width:70px'>"
+              "<button class='mini'>保存轮数</button></form> "
+              "<form method='post' action='/admin/assistant' style='display:inline'>"
+              "<input type='hidden' name='act' value='ctxclear_all'>"
+              "<button class='mini'>清空全部用户上下文</button></form></p>"
+            + "<p>清除单用户上下文：<form method='post' action='/admin/assistant' "
+              "style='display:inline'>"
+              "<input type='hidden' name='act' value='ctxclear'>"
+              "<input name='u' placeholder='账号' style='width:160px'>"
+              "<button class='mini'>清除</button></form></p>"
+            + "<h4>询问记录</h4>"
+            + rec
+            + "<p class='tip'><a href='/admin'>返回管理中心</a></p>"
+            + M.FOOTER)
+    return (f"<!doctype html><html><head><meta charset='utf-8'>{M.STYLE}"
+            f"<title>Assistant 管理</title></head><body><h3>Assistant 管理</h3>{body}</body></html>")

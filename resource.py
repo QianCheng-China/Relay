@@ -2,30 +2,36 @@
 """
 Relay Resource 模块：课件查看 + Resource Librarian（扫描/索引双轨制）
 数据：data/resource/{resource.db, resource.log, index/<fid>.json, cache/<fid>/page-NNN.png}
-管线（Build 40 起）：Office 文档 → LibreOffice 无头转换 PDF（独立进程+独立 profile+
-      180s 硬超时，绝不触碰教师前台会话——修复"转换导致正在播放的课件闪退/弹框"）
-      → PyMuPDF 逐页 PNG(1080px)；文本层提取；扫描件/图片走 Windows OCR（可选）；
-      AI 总结学科+关键词（独立并发2，AI 空闲/夜间窗口运行，忙碌自动让路）。
-      ⚠ 不再依赖 pywin32 / Microsoft Office COM；需安装 LibreOffice（管理页可改路径）。
-Build 40 (v1.1) 变更：
-- LibreOffice 无头管线替换 COM（修复问题4：弹框/拖垮前台/Word 崩溃波及）。
-- 扫描排除 ~$ 锁文件与 .tmp（修复问题5 的无效文件与转换重试风暴）。
-- 提取文本 <30 字符跳过 AI 总结（修复空文本→提示词回声式幻觉关键词）；关键词黑名单。
-- 重建索引时同步清空 kw 表。
-- Relay Hold v2：列表滚动由主程序全局心跳接管；图片缩放/平移专用心跳保留。
+管线：Office 文档 → LibreOffice 无头转换 PDF（独立进程+独立 profile+180s 硬超时，
+绝不触碰教师前台会话）→ PyMuPDF 逐页 PNG(1080px)；文本层提取；扫描件/图片走
+Windows OCR（可选）；AI 总结学科+关键词（独立并发2，AI 空闲/夜间窗口运行，忙碌自动让路）。
+⚠ 不依赖 pywin32 / Microsoft Office COM；需安装 LibreOffice（管理页可改路径）。
+
+Relay 3.0 · CTU 变更：
+ - 补上缺失的 _soffice_path()（原文件缺失导致 office_to_pdf 与 /admin/resource
+   一调用即 NameError 500）
+ - _conv_one 转换产物统一落盘为 src.pdf（文本索引与按需重渲染均以此为源，
+   此前 Office 文档的文本索引静默退化、按需重渲染失败）
+ - VSTYLE 补 .stchip 样式（索引状态/LibreOffice 状态徽标此前无样式定义）
+Build 40 (v1.1) 保留：
+ - LibreOffice 无头管线替换 COM；~$ 锁文件与 .tmp 排除；
+   空(<30字符)文本跳过 AI 总结（防提示词回声幻觉）；重建索引清空 kw 表；
+   Hold v2：列表滚动由主程序全局心跳接管，图片缩放/平移专用心跳保留。
 """
 import hashlib, json, os, queue, re, shutil, subprocess, threading, time
 from datetime import datetime
 from html import escape as esc
 from urllib.parse import quote
+from pathlib import Path
 from flask import Blueprint, redirect, request, send_file
 
 M = None
 AST = None
-
+RES_DB = RES_LOG = INDEX_DIR = CACHE_DIR = None
+log = None
 _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-LO_TIMEOUT = 180          # LibreOffice 单文件转换硬超时（秒）
-LO_PROFILE = None         # init 时赋值：独立 profile，杜绝任何交互弹窗
+LO_TIMEOUT = 180      # LibreOffice 单文件转换硬超时（秒）
+LO_PROFILE = None     # init 时赋值：独立 profile，杜绝任何交互弹窗
 
 def init(m, ast=None):
     global M, AST, RES_DB, RES_LOG, INDEX_DIR, CACHE_DIR, LO_PROFILE, log
@@ -61,6 +67,7 @@ try:
 except ImportError:
     fitz = None
     HAVE_FITZ = False
+
 try:
     import winrt.windows.media.ocr as _wocr
     import winrt.windows.globalization as _wglob
@@ -76,7 +83,7 @@ IMG = {".png", ".jpg", ".jpeg"}
 PAGE_W, THUMB_W, TPP = 1080, 160, 24
 OCR_PAGE_CAP = 60
 CONV_REFRESH = 5
-AI_MIN_TEXT = 30          # 提取文本少于此长度：跳过 AI 总结（防提示词回声幻觉）
+AI_MIN_TEXT = 30   # 提取文本少于此长度：跳过 AI 总结（防提示词回声幻觉）
 _KW_BLOCK = {"文件名", "内容摘录", "学科", "关键词", "关键词提取", "主题", "分析",
              "输出", "json", "学科名", "格式要求", "其他"}
 
@@ -188,8 +195,10 @@ def ocr_bytes(data):
         log.warning("OCR 失败：%s", e)
         return ""
 
-# ---------------- LibreOffice 无头转换（Build 40：替换 COM，绝不触碰前台） ----------------
+# ---------------- LibreOffice 无头转换 ----------------
 def _soffice_path():
+    """soffice.exe 探测:管理页配置优先,其次默认安装位置;找不到返回空串。
+    CTU 修复:原文件缺失本函数,office_to_pdf 与 /admin/resource 均会 NameError。"""
     p = (sget("soffice_path") or "").strip()
     if p and os.path.exists(p):
         return p
@@ -197,50 +206,33 @@ def _soffice_path():
               r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
         if os.path.exists(c):
             return c
-    return None
-
-def _kill_tree(pid):
-    try:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, creationflags=_NOWIN)
-    except Exception:
-        pass
+    return ""
 
 def office_to_pdf(src, outdir):
-    """LibreOffice 无头转换。独立短进程 + 独立 profile + 硬超时：
-    任何文件问题（损坏/被 WPS 锁定/加密）只表现为子进程失败，绝不弹窗、不影响前台。"""
     soffice = _soffice_path()
     if not soffice:
-        raise RuntimeError("未找到 soffice.exe：请安装 LibreOffice（默认路径），"
-                           "或在 Resource 管理页填写完整路径")
-    prof = LO_PROFILE.replace("\\", "/")
-    prof_url = "file:///" + quote(prof)
-    cmd = [soffice, "--headless", "--norestore", "--nolockcheck",
-           "-env:UserInstallation=" + prof_url,
+        raise RuntimeError("未找到 soffice.exe,请安装 LibreOffice 或在管理页填写完整路径")
+    # CTU:标准文件 URI(旧 quote 方案在部分 LibreOffice 版本上解析失败,
+    # 触发"配置文件损坏"对话框)
+    prof_uri = Path(LO_PROFILE).as_uri()
+    # 清理可能损坏的残留配置(防 bootstrap.ini corrupt)
+    for sub in ("user/config", "user/backup"):
+        shutil.rmtree(os.path.join(LO_PROFILE, sub), ignore_errors=True)
+    cmd = [soffice, "--headless", "--nologo", "--invisible", "--nolockcheck", "--norestore",
+           "-env:UserInstallation=" + prof_uri,
            "--convert-to", "pdf", "--outdir", outdir, src]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             creationflags=_NOWIN)
     try:
-        proc.wait(timeout=LO_TIMEOUT)
+        out, err = proc.communicate(timeout=LO_TIMEOUT)
     except subprocess.TimeoutExpired:
-        _kill_tree(proc.pid)
-        raise RuntimeError("转换超时（%d 秒），已强制终止" % LO_TIMEOUT)
-    stem = os.path.splitext(os.path.basename(src))[0]
-    produced = os.path.join(outdir, stem + ".pdf")
-    target = os.path.join(outdir, "src.pdf")
-    if not os.path.exists(produced) or os.path.getsize(produced) == 0:
-        rc = proc.returncode
-        raise RuntimeError("LibreOffice 转换失败（退出码 %s）：文件可能损坏、加密或被占用" % rc)
-    if produced != target:
-        try:
-            os.replace(produced, target)
-        except OSError:
-            shutil.copyfile(produced, target)
-            try:
-                os.remove(produced)
-            except OSError:
-                pass
-    return target
+        proc.kill()
+        raise RuntimeError("LibreOffice 转换超时(%ds)" % LO_TIMEOUT)
+    pdf = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+    if proc.returncode != 0 or not os.path.exists(pdf):
+        raise RuntimeError("LibreOffice 转换失败(code=%d)%s"
+                           % (proc.returncode, (err or b"")[-200:].decode("gbk", "ignore")))
+    return pdf
 
 def render_pdf(fid, pdfsrc):
     if not HAVE_FITZ:
@@ -300,6 +292,11 @@ def _conv_one(fid):
             cdir = os.path.join(CACHE_DIR, fid)
             os.makedirs(cdir, exist_ok=True)
             pdf = office_to_pdf(row["path"], cdir)
+            # CTU 修复:统一落盘为 src.pdf——_index_one 文本提取与按需重渲染均以此为源
+            try:
+                shutil.copyfile(pdf, os.path.join(cdir, "src.pdf"))
+            except OSError as e:
+                log.warning("src.pdf 落盘失败 fid=%s:%s", fid, e)
             n = render_pdf(fid, pdf)
             M.dbq(RES_DB, "UPDATE files SET conv='ready', pages=?, err='' WHERE fid=?", (n, fid))
             log.info("转换完成 %s（%d 页）", row["name"], n)
@@ -443,7 +440,7 @@ def _ai_session():
         if _ai is None:
             import requests as http
             _ai = http.Session()
-        return _ai
+    return _ai
 
 def _ai_idle():
     if not AST:
@@ -482,14 +479,14 @@ def _ai_summary(name, text):
         try:
             with _ai_sem:
                 r = M.ai_post(_ai_session(), payload, 60)
-            r.raise_for_status()
-            content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
-            mobj = re.search(r"\{.*\}", content, re.S)
-            obj = json.loads(mobj.group(0))
-            sub = str(obj.get("subject") or "其他").strip()
-            if sub not in subjects and sub != "其他":
-                sub = "其他"
-            return sub, _clean_kws(obj.get("keywords"))
+                r.raise_for_status()
+                content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+                mobj = re.search(r"\{.*\}", content, re.S)
+                obj = json.loads(mobj.group(0))
+                sub = str(obj.get("subject") or "其他").strip()
+                if sub not in subjects and sub != "其他":
+                    sub = "其他"
+                return sub, _clean_kws(obj.get("keywords"))
         except Exception as e:
             log.warning("AI 总结失败 %s：%s", name, e)
             time.sleep(2)
@@ -546,10 +543,11 @@ def _index_one(fid):
         else:
             if not _ready(row):
                 enqueue(row)
-                if not _wait_ready(fid):
-                    _mark_idx(fid, "failed", "转换/渲染未就绪或失败，请在管理页重试")
-                    return
-                row = frow(fid)
+            if not _wait_ready(fid):
+                _mark_idx(fid, "failed", "转换/渲染未就绪或失败，请在管理页重试")
+                return
+            row = frow(fid)
+            # CTU:OFFICE 文档的 PDF 已统一落盘为 src.pdf(_conv_one)
             src = row["path"] if row["ext"] == ".pdf" else os.path.join(CACHE_DIR, fid, "src.pdf")
             text = _pdf_text(src)
             if len(text.strip()) < 100:
@@ -558,7 +556,7 @@ def _index_one(fid):
         log.exception("文本提取失败 fid=%s", fid)
         _mark_idx(fid, "failed", "提取失败：" + str(e)[:120])
         return
-    # 修复问题5：无可提取文本时绝不调用 AI（防止提示词回声式幻觉关键词），仅文件名可检索
+    # 无可提取文本时绝不调用 AI（防提示词回声式幻觉关键词），仅文件名可检索
     if len(text.strip()) < AI_MIN_TEXT:
         _mark_idx(fid, "text_only", "无可提取文本（图片/扫描件无文字或未装OCR），仅文件名可检索")
         log.info("索引完成(无文本) %s", row["name"])
@@ -624,9 +622,10 @@ def start_background():
     threading.Thread(target=lambda: (time.sleep(1), scan_now()), daemon=True).start()
     log.info("Resource 后台线程已启动（扫描/索引/LibreOffice转换队列）")
 
-# ---------------- Relay Hold：图片缩放/平移（文档页码由全局 URL 心跳+服务端兜底） ----------------
+# ---------------- Relay Hold：图片缩放/平移 ----------------
 def hold_get(u, fid):
-    r = M.dbq(RES_DB, "SELECT page,scale,pan_x,pan_y FROM progress WHERE user=? AND fid=?", (u, fid))
+    r = M.dbq(RES_DB, "SELECT page,scale,pan_x,pan_y FROM progress WHERE user=? AND fid=?",
+              (u, fid))
     if r:
         return {"page": max(1, int(r[0][0] or 1)), "scale": float(r[0][1] or 1),
                 "pan_x": float(r[0][2] or 0), "pan_y": float(r[0][3] or 0)}
@@ -646,51 +645,59 @@ def hold_save(u, fid, page=None, scale=None, pan_x=None, pan_y=None):
           (u, fid, cur["page"], cur["scale"], cur["pan_x"], cur["pan_y"], time.time()))
 
 # ---------------- 页面片段 ----------------
-VSTYLE = ("<style>.pv{width:100%;border:1px solid #e2e8f0;border-radius:6px;margin:6px 0;"
- "display:block}.thumbs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}"
+VSTYLE = ("<style>"
+ ".stchip{display:inline-block;border-radius:10px;padding:2px 10px;font-size:13px;"
+ "background:#e2e8f0;color:#334155}"
+ ".stchip.done{background:#dcfce7;color:#166534}"
+ ".stchip.run{background:#dbeafe;color:#1d4ed8}"
+ ".stchip.pend{background:#fef3c7;color:#92400e}"
+ ".pv{width:100%;border:1px solid #e2e8f0;border-radius:6px;margin:6px 0;display:block}"
+ ".thumbs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}"
  ".tcell{width:calc(25% - 6px);text-align:center;text-decoration:none;color:#4a5568;font-size:12px}"
  ".tcell img{width:100%;border:1px solid #cbd5e0;border-radius:4px;display:block}"
  ".navbtns{display:flex;gap:8px}.navbtns a{flex:1}</style>")
 
 _IMG_JS = ("<script>(function(){"
- "var s=__S__,px=__PX__,py=__PY__,dr=false,lx=0,ly=0,t=null;"
- "var im=document.getElementById('im'),w=document.getElementById('w');"
- "function ap(){im.style.transform='translate('+px+'px,'+py+'px) scale('+s+')';}"
- "function cl(){var W=im.clientWidth,H=im.clientHeight;"
- "px=Math.min(0,Math.max(W*(1-s),px));py=Math.min(0,Math.max(H*(1-s),py));}"
- "function sv(){if(t)clearTimeout(t);t=setTimeout(function(){var x=new XMLHttpRequest();"
- "x.open('POST','/resource/hold',true);"
- "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
- "x.send('fid=__FID__&page=1&scale='+s+'&pan_x='+px+'&pan_y='+py);},400);}"
- "function z(f){s=Math.min(5,Math.max(1,s*f));cl();ap();sv();}"
- "function rs(){s=1;px=0;py=0;ap();sv();}"
- "function ds(x,y){dr=true;lx=x;ly=y;}"
- "function dm(x,y){if(!dr)return;px+=x-lx;py+=y-ly;lx=x;ly=y;cl();ap();}"
- "function de(){if(dr){dr=false;sv();}}"
- "w.addEventListener('touchstart',function(e){ds(e.touches[0].clientX,e.touches[0].clientY);},false);"
- "w.addEventListener('touchmove',function(e){e.preventDefault();dm(e.touches[0].clientX,e.touches[0].clientY);},false);"
- "w.addEventListener('touchend',de,false);"
- "w.addEventListener('mousedown',function(e){ds(e.clientX,e.clientY);},false);"
- "w.addEventListener('mousemove',function(e){if(dr)dm(e.clientX,e.clientY);},false);"
- "w.addEventListener('mouseup',de,false);w.addEventListener('mouseleave',de,false);"
- "window.addEventListener('pagehide',sv);"
- "var a=document.getElementById('zi');if(a)a.onclick=function(){z(1.3);return false;};"
- "var b=document.getElementById('zo');if(b)b.onclick=function(){z(1/1.3);return false;};"
- "var c=document.getElementById('zr');if(c)c.onclick=function(){rs();return false;};"
- "cl();ap();})();</script>")
+           "var s=__S__,px=__PX__,py=__PY__,dr=false,lx=0,ly=0,t=null;"
+           "var im=document.getElementById('im'),w=document.getElementById('w');"
+           "function ap(){im.style.transform='translate('+px+'px,'+py+'px) scale('+s+')';}"
+           "function cl(){var W=im.clientWidth,H=im.clientHeight;"
+           "px=Math.min(0,Math.max(W*(1-s),px));py=Math.min(0,Math.max(H*(1-s),py));}"
+           "function sv(){if(t)clearTimeout(t);t=setTimeout(function(){var x=new XMLHttpRequest();"
+           "x.open('POST','/resource/hold',true);"
+           "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
+           "x.send('fid=__FID__&page=1&scale='+s+'&pan_x='+px+'&pan_y='+py);},400);}"
+           "function z(f){s=Math.min(5,Math.max(1,s*f));cl();ap();sv();}"
+           "function rs(){s=1;px=0;py=0;ap();sv();}"
+           "function ds(x,y){dr=true;lx=x;ly=y;}"
+           "function dm(x,y){if(!dr)return;px+=x-lx;py+=y-ly;lx=x;ly=y;cl();ap();}"
+           "function de(){if(dr){dr=false;sv();}}"
+           "w.addEventListener('touchstart',function(e){ds(e.touches[0].clientX,e.touches[0].clientY);},false);"
+           "w.addEventListener('touchmove',function(e){e.preventDefault();dm(e.touches[0].clientX,e.touches[0].clientY);},false);"
+           "w.addEventListener('touchend',de,false);"
+           "w.addEventListener('mousedown',function(e){ds(e.clientX,e.clientY);},false);"
+           "w.addEventListener('mousemove',function(e){if(dr)dm(e.clientX,e.clientY);},false);"
+           "w.addEventListener('mouseup',de,false);w.addEventListener('mouseleave',de,false);"
+           "window.addEventListener('pagehide',sv);"
+           "var a=document.getElementById('zi');if(a)a.onclick=function(){z(1.3);return false;};"
+           "var b=document.getElementById('zo');if(b)b.onclick=function(){z(1/1.3);return false;};"
+           "var c=document.getElementById('zr');if(c)c.onclick=function(){rs();return false;};"
+           "cl();ap();})();</script>")
 
 _PPT_JS = ("<script>(function(){var x=0,y=0;"
- "document.addEventListener('touchstart',function(e){x=e.touches[0].clientX;y=e.touches[0].clientY;},false);"
- "document.addEventListener('touchend',function(e){"
- "var dx=e.changedTouches[0].clientX-x,dy=e.changedTouches[0].clientY-y;"
- "if((dx<-60||dy<-60)&&__NH__)location.href=__NU__;else if((dx>60||dy>60)&&__PH__)location.href=__PU__;},false);})();</script>")
+           "document.addEventListener('touchstart',function(e){x=e.touches[0].clientX;y=e.touches[0].clientY;},false);"
+           "document.addEventListener('touchend',function(e){"
+           "var dx=e.changedTouches[0].clientX-x,dy=e.changedTouches[0].clientY-y;"
+           "if((dx<-60||dy<-60)&&__NH__)location.href=__NU__;"
+           "else if((dx>60||dy>60)&&__PH__)location.href=__PU__;},false);})();</script>")
 
 def _page_shell(title, body, extra_head=""):
     # Relay Hold v2：所有用户页面注入全局 URL+滚动心跳
     u = M.current_user()
     js = M.hold_loc_js(u) if u else ""
     return (f"<!doctype html><html><head><meta charset='utf-8'>{extra_head}{M.STYLE}{M.ANIM_STYLE}"
-            f"{VSTYLE}<title>{esc(title)}</title></head><body>{body}" + js + "</body></html>")
+            f"{VSTYLE}<title>{esc(title)}</title></head><body>{body}"
+            + js + "</body></html>")
 
 def _slink(q, sf, sd, cur_f, cur_d, label):
     on = " on" if (sf == cur_f and sd == cur_d) else ""
@@ -731,22 +738,28 @@ def res_list():
         if r[5]:
             chip += "<span class='chip'>" + esc(r[5]) + "</span>"
         items += (f"<a class='litem' href='/resource/view/{r[0]}'>"
-                  f"<div class='fname'>{esc(r[1])}<span class='chip'>{esc((r[2] or '').lstrip('.').upper())}</span>{chip}</div>"
+                  f"<div class='fname'>{esc(r[1])}"
+                  f"<span class='chip'>{esc((r[2] or '').lstrip('.').upper())}</span>{chip}</div>"
                   f"<div class='fmeta'>{fmt_ts(r[4])} · {human(r[3])}</div></a>")
     if not rows:
         items = "<p class='tip'>没有匹配的文件。教师可将课件放入管理页指定的文件夹。</p>"
     srch = ("<form method='get' action='/resource' style='display:flex;gap:6px'>"
             f"<input name='q' value='{esc(q)}' placeholder='搜索：文件名 / 学科 / 关键词'>"
             "<button type='submit' style='width:auto;padding:10px 16px'>搜索</button></form>"
-            + (f"<p class='tip'>正在筛选“{esc(q)}” · <a href='/resource'>清除筛选</a></p>" if q else ""))
-    sorts = "".join([_slink(q, "name", "asc", sf, sd, "名称↑"), _slink(q, "name", "desc", sf, sd, "名称↓"),
-                     _slink(q, "size", "asc", sf, sd, "大小↑"), _slink(q, "size", "desc", sf, sd, "大小↓"),
-                     _slink(q, "mtime", "asc", sf, sd, "时间↑"), _slink(q, "mtime", "desc", sf, sd, "时间↓")])
-    body = (M.back_btn("/home") + "<h3>Resource · 课件资源</h3>" + srch +
-            f"<div class='rowline'><span><span class='stchip {st}'>{sttxt}</span>"
-            f"<a class='slink' href='/resource'>刷新</a></span><span>{sorts}</span></div>"
-            f"<p class='tip'>共 {len(rows)} 个文件（全部文件夹合并列出）</p>" + items
-            + M.REOPEN_TIP + M.FOOTER)
+            + (f"<p class='tip'>正在筛选“{esc(q)}” · <a href='/resource'>清除筛选</a></p>"
+               if q else ""))
+    sorts = "".join([_slink(q, "name", "asc", sf, sd, "名称↑"),
+                     _slink(q, "name", "desc", sf, sd, "名称↓"),
+                     _slink(q, "size", "asc", sf, sd, "大小↑"),
+                     _slink(q, "size", "desc", sf, sd, "大小↓"),
+                     _slink(q, "mtime", "asc", sf, sd, "时间↑"),
+                     _slink(q, "mtime", "desc", sf, sd, "时间↓")])
+    body = (M.back_btn("/home") + "<h3>Resource · 课件资源</h3>"
+            + srch
+            + f"<div class='rowline'><span><span class='stchip {st}'>{sttxt}</span>"
+              f"<a class='slink' href='/resource'>刷新</a></span><span>{sorts}</span></div>"
+            + f"<p class='tip'>共 {len(rows)} 个文件（全部文件夹合并列出）</p>"
+            + items + M.REOPEN_TIP + M.FOOTER)
     return _page_shell("Resource", body)
 
 # ---------------- 路由：查看器 ----------------
@@ -759,29 +772,30 @@ def res_view(fid):
     if not row:
         return M.msg_page("文件不存在或已被移除。", "/resource")
     ext = row["ext"]
-
     if ext in IMG:
         prog = hold_get(u, fid)
         js = (_IMG_JS.replace("__S__", repr(prog["scale"]))
-              .replace("__PX__", repr(prog["pan_x"])).replace("__PY__", repr(prog["pan_y"]))
-              .replace("__FID__", fid))
+                     .replace("__PX__", repr(prog["pan_x"]))
+                     .replace("__PY__", repr(prog["pan_y"]))
+                     .replace("__FID__", fid))
         body = (M.back_btn("/resource") + "<h3>" + esc(row["name"]) + "</h3>"
                 "<p><button class='mini' id='zi'>放大</button> "
                 "<button class='mini' id='zo'>缩小</button> "
                 "<button class='mini' id='zr'>还原</button> "
                 "<span class='tip'>拖动以移动</span></p>"
-                f"<div id='w' style='height:75vh;min-height:360px;overflow:hidden;position:relative;"
-                f"background:#f4f6f8;border-radius:6px'>"
+                f"<div id='w' style='height:75vh;min-height:360px;overflow:hidden;"
+                f"position:relative;background:#f4f6f8;border-radius:6px'>"
                 f"<img id='im' src='/resource/raw/{fid}' draggable='false' "
                 f"style='width:100%;display:block;transform-origin:0 0'></div>"
                 + M.REOPEN_TIP + M.FOOTER + js)
         return _page_shell(row["name"], body)
-
     if row["conv"] == "failed" and request.args.get("retry") != "1":
         body = (M.back_btn("/resource") + "<h3>" + esc(row["name"]) + "</h3>"
-                "<p class='err'>该文件转换失败：</p><pre>" + esc(row["err"] or "未知原因") + "</pre>"
+                "<p class='err'>该文件转换失败：</p><pre>"
+                + esc(row["err"] or "未知原因") + "</pre>"
                 "<p class='tip'>可轻触下方按钮尝试重新转换，或联系管理员重试。</p>"
-                f"<a class='btn2' href='/resource/view/{fid}?retry=1'>重试</a>" + M.FOOTER)
+                f"<a class='btn2' href='/resource/view/{fid}?retry=1'>重试</a>"
+                + M.FOOTER)
         return _page_shell(row["name"], body)
     if not _ready(row):
         if request.args.get("retry") == "1":
@@ -789,7 +803,7 @@ def res_view(fid):
                 M.dbq(RES_DB, "UPDATE files SET conv='none', err='' WHERE fid=?", (fid,))
             else:
                 M.dbq(RES_DB, "UPDATE files SET pages=0, err='' WHERE fid=?", (fid,))
-        enqueue(row)
+            enqueue(row)
         vurl = "/resource/view/" + fid
         body = (M.back_btn("/resource") + "<h3>" + esc(row["name"]) + "</h3>"
                 "<div class='fadein'><p class='queue'><span class='spinner'></span>正在准备文件"
@@ -797,7 +811,6 @@ def res_view(fid):
                 "<p class='tip'>首次访问需要转换/渲染</p></div>" + M.FOOTER)
         return _page_shell(row["name"], body,
                            extra_head=f"<meta http-equiv='refresh' content='{CONV_REFRESH};url={vurl}'>")
-
     pages = int(row["pages"] or 0)
     prog = hold_get(u, fid)
     try:
@@ -805,8 +818,7 @@ def res_view(fid):
     except ValueError:
         p = prog["page"]
     p = max(1, min(pages, p))
-    hold_save(u, fid, page=p)   # 服务端兜底；主恢复链路由全局 URL 心跳承担
-
+    hold_save(u, fid, page=p)  # 服务端兜底；主恢复链路由全局 URL 心跳承担
     vurl = "/resource/view/" + fid
     if request.args.get("thumbs"):
         tpages = (pages + TPP - 1) // TPP
@@ -829,7 +841,6 @@ def res_view(fid):
                 f"<a class='slink' href='{vurl}?page={p}'>‹ 返回第 {p} 页阅读</a></p>"
                 f"<div class='thumbs'>{cells}</div>" + M.FOOTER)
         return _page_shell(row["name"], body)
-
     prev = vurl + "?page=%d" % max(1, p - 1)
     nxt = vurl + "?page=%d" % min(pages, p + 1)
     jump = (f"<form method='get' action='{vurl}' style='display:inline'>"
@@ -849,9 +860,9 @@ def res_view(fid):
             + M.REOPEN_TIP + M.FOOTER)
     if ext in (".ppt", ".pptx"):
         js = (_PPT_JS.replace("__NH__", "1" if p < pages else "0")
-              .replace("__NU__", '"' + nxt + '"')
-              .replace("__PH__", "1" if p > 1 else "0")
-              .replace("__PU__", '"' + prev + '"'))
+                     .replace("__NU__", '"' + nxt + '"')
+                     .replace("__PH__", "1" if p > 1 else "0")
+                     .replace("__PU__", '"' + prev + '"'))
         body += js
     return _page_shell(row["name"], body)
 
@@ -887,7 +898,9 @@ def res_page(fid, n):
         with _rlock(fid):
             if not os.path.exists(pf):
                 try:
-                    src = row["path"] if row["ext"] == ".pdf" else os.path.join(CACHE_DIR, fid, "src.pdf")
+                    # CTU:OFFICE 文档的 PDF 已统一落盘为 src.pdf
+                    src = row["path"] if row["ext"] == ".pdf" \
+                        else os.path.join(CACHE_DIR, fid, "src.pdf")
                     m = render_pdf(fid, src)
                     M.dbq(RES_DB, "UPDATE files SET pages=? WHERE fid=?", (m, fid))
                 except Exception as e:
@@ -912,16 +925,19 @@ def res_hold():
     fid = request.form.get("fid", "")
     if not frow(fid):
         return "", 204
+
     def _f(v):
         try:
             return float(v)
         except (TypeError, ValueError):
             return None
+
     def _i(v):
         try:
             return int(v)
         except (TypeError, ValueError):
             return None
+
     hold_save(u, fid, page=_i(request.form.get("page")),
               scale=_f(request.form.get("scale")),
               pan_x=_f(request.form.get("pan_x")),
@@ -974,9 +990,11 @@ def admin_resource():
             for r in M.dbq(RES_DB, "SELECT fid,ext,pages,conv FROM files"):
                 if r[1] in OFFICE and r[3] in ("none", "failed"):
                     M.dbq(RES_DB, "UPDATE files SET conv='queued' WHERE fid=?", (r[0],))
-                    enqueue(frow(r[0])); n += 1
+                    enqueue(frow(r[0]))
+                    n += 1
                 elif r[1] == ".pdf" and int(r[2] or 0) <= 0:
-                    enqueue(frow(r[0])); n += 1
+                    enqueue(frow(r[0]))
+                    n += 1
             msg = "已加入转换/渲染队列 %d 个文件（串行执行，可在文件列表观察进度）" % n
         elif act == "rebuild":
             for (fid,) in M.dbq(RES_DB, "SELECT fid FROM files"):
@@ -985,7 +1003,7 @@ def admin_resource():
                 except OSError:
                     pass
             M.dbq(RES_DB, "UPDATE files SET idx='pending'")
-            M.dbq(RES_DB, "DELETE FROM kw")   # Build 40：重建时同步清空关键词表（清洗旧幻觉数据）
+            M.dbq(RES_DB, "DELETE FROM kw")  # 重建时同步清空关键词表（清洗旧幻觉数据）
             msg = "已请求重建全部索引（含旧关键词清洗；将在夜间窗口或 AI 空闲时执行）"
         elif act == "clearcache":
             for d in os.listdir(CACHE_DIR):
@@ -1006,7 +1024,6 @@ def admin_resource():
                 msg = "已重新入队：" + row["name"]
     except Exception as e:
         msg = "操作失败：%s" % e
-
     folders = "\n".join(get_folders())
     subjects = "，".join(get_subjects())
     st, sttxt = _indicator()
@@ -1018,40 +1035,46 @@ def admin_resource():
         f"<tr><td>{esc(r[1])}</td><td class='tip'>{esc(r[2] or '')[:120]}</td>"
         f"<td><form method='post' action='/admin/resource' style='display:inline'>"
         f"<input type='hidden' name='act' value='retry'><input type='hidden' name='fid' value='{r[0]}'>"
-        f"<button class='mini'>重试</button></form></td></tr>" for r in failed)
+        f"<button class='mini'>重试</button></form></td></tr>"
+        for r in failed)
     body = (M.back_btn("/admin") + ("<p class='err'>" + esc(msg) + "</p>" if msg else "")
             + f"<p>LibreOffice：<span class='stchip {'done' if soffice_ok else 'pend'}'>"
-            f"{'已就绪' if soffice_ok else '未找到（Office 文档将无法转换）'}</span> · "
-            f"索引状态：<span class='stchip {st}'>{sttxt}</span> · 待索引 {pend} · "
-            f"当前：{esc(cur)} · 让路中：{'是' if _idx_state['yielding'] else '否'}</p>"
+              f"{'已就绪' if soffice_ok else '未找到（Office 文档将无法转换）'}</span> · "
+              f"索引状态：<span class='stchip {st}'>{sttxt}</span> · 待索引 {pend} · "
+              f"当前：{esc(cur)} · 让路中：{'是' if _idx_state['yielding'] else '否'}</p>"
             + "<form method='post' action='/admin/resource'>"
-            "<input type='hidden' name='act' value='save'>"
-            "<h4>soffice.exe 路径（留空=自动探测默认安装位置）</h4>"
-            f"<input name='soffice' value='{esc(sget('soffice_path'))}' "
-            f"placeholder='C:\\Program Files\\LibreOffice\\program\\soffice.exe'>"
-            "<h4>课件文件夹（每行一个，支持本地盘与 UNC 路径；勿含相机照片目录）</h4>"
-            f"<textarea name='folders' rows='4'>{esc(folders)}</textarea>"
-            "<h4>学科列表（逗号分隔；判不出的归“其他”）</h4>"
-            f"<input name='subjects' value='{esc(subjects)}'>"
-            "<h4>夜间索引时间窗</h4>"
-            f"<p>开始 <input name='ns' value='{esc(sget('night_start'))}' style='width:100px;display:inline-block;padding:6px'> "
-            f"结束 <input name='ne' value='{esc(sget('night_end'))}' style='width:100px;display:inline-block;padding:6px'>（HH:MM，支持跨零点）</p>"
-            "<label><input type='checkbox' name='idle' value='1' "
-            + ("checked" if sget("idle_index", "0") == "1" else "")
-            + "> AI 空闲时也更新索引（Assistant 忙碌时自动暂停）</label>"
-            "<button type='submit'>保存设置</button></form>"
-            "<h4>手动操作</h4><p>"
-            "<form method='post' action='/admin/resource' style='display:inline'>"
-            "<input type='hidden' name='act' value='scan'><button class='mini'>立即扫描</button></form> "
-            "<form method='post' action='/admin/resource' style='display:inline'>"
-            "<input type='hidden' name='act' value='warm'><button class='mini'>预热全部转换</button></form> "
-            "<form method='post' action='/admin/resource' style='display:inline'>"
-            "<input type='hidden' name='act' value='rebuild'><button class='mini'>重建全部索引（清洗旧关键词）</button></form> "
-            "<form method='post' action='/admin/resource' style='display:inline'>"
-            "<input type='hidden' name='act' value='clearcache'><button class='mini'>清空渲染缓存</button></form></p>"
+              "<input type='hidden' name='act' value='save'>"
+              "<h4>soffice.exe 路径（留空=自动探测默认安装位置）</h4>"
+              f"<input name='soffice' value='{esc(sget('soffice_path'))}' "
+              f"placeholder='C:\\Program Files\\LibreOffice\\program\\soffice.exe'>"
+              "<h4>课件文件夹（每行一个，支持本地盘与 UNC 路径；勿含相机照片目录）</h4>"
+              f"<textarea name='folders' rows='4'>{esc(folders)}</textarea>"
+              "<h4>学科列表（逗号分隔；判不出的归“其他”）</h4>"
+              f"<input name='subjects' value='{esc(subjects)}'>"
+              "<h4>夜间索引时间窗</h4>"
+              f"<p>开始 <input name='ns' value='{esc(sget('night_start'))}' "
+              f"style='width:100px;display:inline-block;padding:6px'> "
+              f"结束 <input name='ne' value='{esc(sget('night_end'))}' "
+              f"style='width:100px;display:inline-block;padding:6px'>（HH:MM，支持跨零点）</p>"
+              "<label><input type='checkbox' name='idle' value='1' "
+              + ("checked" if sget("idle_index", "0") == "1" else "")
+              + "> AI 空闲时也更新索引（Assistant 忙碌时自动暂停）</label>"
+              "<button type='submit'>保存设置</button></form>"
+            + "<h4>手动操作</h4><p>"
+              "<form method='post' action='/admin/resource' style='display:inline'>"
+              "<input type='hidden' name='act' value='scan'><button class='mini'>立即扫描</button></form> "
+              "<form method='post' action='/admin/resource' style='display:inline'>"
+              "<input type='hidden' name='act' value='warm'><button class='mini'>预热全部转换</button></form> "
+              "<form method='post' action='/admin/resource' style='display:inline'>"
+              "<input type='hidden' name='act' value='rebuild'>"
+              "<button class='mini'>重建全部索引（清洗旧关键词）</button></form> "
+              "<form method='post' action='/admin/resource' style='display:inline'>"
+              "<input type='hidden' name='act' value='clearcache'>"
+              "<button class='mini'>清空渲染缓存</button></form></p>"
             + ("<h4>转换失败的文件</h4><table border='1'><tr><th>文件</th><th>原因</th><th>操作</th></tr>"
                + frows + "</table>" if failed else "")
-            + "<p class='tip'><a href='/admin'>返回管理中心</a> · <a href='/resource'>打开 Resource 列表</a></p>"
+            + "<p class='tip'><a href='/admin'>返回管理中心</a> · "
+              "<a href='/resource'>打开 Resource 列表</a></p>"
             + M.FOOTER)
-    return (f"<!doctype html><html><head><meta charset='utf-8'>{M.STYLE}<title>Resource 管理</title>"
-            f"</head><body><h3>Resource 管理</h3>{body}</body></html>")
+    return (f"<!doctype html><html><head><meta charset='utf-8'>{M.STYLE}{VSTYLE}"
+            f"<title>Resource 管理</title></head><body><h3>Resource 管理</h3>{body}</body></html>")

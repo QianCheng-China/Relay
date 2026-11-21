@@ -115,8 +115,9 @@ def _token_exp(tok):
 
 def _auth_fetch():
     ns, pw, aid = sget("namespace"), sget("password"), sget("app_id")
-    if not (ns and pw and aid):
-        raise KVError("鉴权模式缺少 namespace / password / appId（管理页补全，或改用令牌模式）")
+    if not (ns and aid):
+        raise KVError("鉴权模式缺少 namespace / appId(password 允许为空;或改用令牌模式)")
+
     try:
         r = _http().post((sget("base_url") or DEF_BASE).rstrip("/") + "/apps/auth/token",
                          json={"namespace": ns, "password": pw, "appId": aid}, timeout=15)

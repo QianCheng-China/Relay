@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Relay 3.0 · CTU</title>
+<style>
+:root{--ink:#f5f5f7;--dim:#a1a1a6;--blue:#2997ff;--purple:#bf5af2;--b2:#2b6cb0;--green:#30d158}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:#000;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Helvetica Neue",sans-serif;
+ -webkit-font-smoothing:antialiased;overflow:hidden;user-select:none;cursor:default}
+#stage{position:fixed;inset:0}
+.orb{position:fixed;border-radius:50%;filter:blur(120px);opacity:.15;pointer-events:none}
+.o1{width:46vw;height:46vw;left:-10vw;top:-14vw;background:#2997ff;animation:drift 22s ease-in-out infinite alternate}
+.o2{width:40vw;height:40vw;right:-8vw;bottom:-12vw;background:#bf5af2;animation:drift 26s ease-in-out infinite alternate-reverse}
+@keyframes drift{from{transform:translate(0,0) scale(1)}to{transform:translate(6vw,4vh) scale(1.15)}}
+/* ── 场景 / 文案 ── */
+.scene{position:fixed;inset:0;z-index:6;opacity:0;visibility:hidden;transition:opacity .45s ease,visibility .45s;pointer-events:none}
+.scene.on{opacity:1;visibility:visible}
+.panel{position:absolute;top:50%;transform:translateY(-50%)}
+.side-l{left:6vw;width:min(600px,40vw)}
+.side-r{right:6vw;width:min(600px,40vw)}
+.mid{left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;width:min(880px,86vw)}
+.anim{opacity:0;transform:translateY(24px);transition:opacity .6s ease var(--d,0s),transform .7s cubic-bezier(.2,.7,.2,1) var(--d,0s)}
+.scene.on .anim{opacity:1;transform:none}
+.h1{font-size:clamp(30px,4.2vw,56px);font-weight:700;letter-spacing:-.02em;line-height:1.16}
+.h2{font-size:clamp(16px,1.8vw,23px);color:var(--dim);font-weight:500;margin-top:13px;line-height:1.55}
+.small{font-size:14px;color:#8e8e93;margin-top:20px;line-height:1.7}
+/* ── WiFi 图标 ── */
+.wifi{width:min(140px,12vw)}
+.wifi path{fill:none;stroke:#2997ff;stroke-width:7;stroke-linecap:round;stroke-dasharray:100;stroke-dashoffset:100}
+.scene.on .wifi path{animation:draw 1s cubic-bezier(.3,.6,.3,1) forwards}
+.scene.on .wifi path:nth-child(2){animation-delay:.22s}
+.scene.on .wifi path:nth-child(3){animation-delay:.44s}
+@keyframes draw{to{stroke-dashoffset:0}}
+.wifi circle{fill:#2997ff;opacity:0}
+.scene.on .wifi circle{animation:pop2 .4s ease .05s forwards}
+@keyframes pop2{to{opacity:1}}
+/* 波纹：延迟期内完全隐形（0% 帧 opacity 0），动作开始才浮现 */
+.ring{position:absolute;left:50%;top:50%;border:2px solid rgba(41,151,255,.65);border-radius:50%;opacity:0;
+ transform:translate(-50%,-50%) scale(.3);pointer-events:none}
+.scene.on .ring{animation:ring 1.4s ease both}
+@keyframes ring{0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}
+ 18%{opacity:.85}
+ 100%{opacity:0;transform:translate(-50%,-50%) scale(1.9)}}
+/* ── 开场版本行（grid 同格堆叠，天然对齐） ── */
+.vline{display:flex;align-items:center;justify-content:center;gap:.38em;font-weight:700;
+ font-size:clamp(34px,5vw,64px);letter-spacing:-.015em;line-height:1.15;margin-top:30px}
+.vslot{display:inline-grid;place-items:center}
+.v{grid-area:1/1;white-space:nowrap}
+.v.old{color:#6e6e73;opacity:1;transform:none;filter:blur(0);
+ transition:opacity .75s ease,transform .75s ease,filter .75s ease}
+.v.new{background:linear-gradient(100deg,#2997ff,#bf5af2 55%,#64d2ff);-webkit-background-clip:text;background-clip:text;color:transparent;
+ opacity:0;transform:translateY(16px);filter:blur(8px);
+ transition:opacity .75s ease,transform .75s ease,filter .75s ease}
+.vline.swap .v.old{opacity:0;transform:translateY(-16px);filter:blur(8px)}
+.vline.swap .v.new{opacity:1;transform:none;filter:blur(0)}
+/* ── 设备（天气幕） ── */
+#dev{--dx:0px;--dy:0px;--s:.9;--r:0deg;position:fixed;left:50%;top:50%;z-index:5;
+ width:min(470px,30vw);aspect-ratio:3/3.94;background:#111114;border-radius:26px;border:9px solid #26262a;
+ box-shadow:0 44px 100px rgba(0,0,0,.65),0 0 0 1.5px rgba(255,255,255,.12),0 0 0 1px rgba(255,255,255,.07) inset;
+ transform:translate(calc(-50% + var(--dx)),calc(-50% + var(--dy))) rotate(var(--r)) scale(var(--s));
+ transition:transform 1.15s cubic-bezier(.3,.75,.25,1),opacity .7s ease .15s,filter .55s ease}
+#dev.p-l1{--dx:-20vw;--dy:0px;--s:.92;--r:-1.2deg}
+#dev.p-off{--dx:var(--off-dx,0px);--dy:var(--off-dy,0px);--s:calc(var(--off-s,.9) * .88);--r:var(--off-r,0deg);
+ opacity:0;filter:blur(14px) brightness(.7);pointer-events:none;
+ transition:transform .9s cubic-bezier(.3,.75,.25,1),opacity .55s ease,filter .55s ease}
+#devInner{width:100%;height:100%;border-radius:18px;position:relative;overflow:hidden;animation:bob 7s ease-in-out infinite}
+@keyframes bob{50%{transform:translateY(-8px)}}
+#scr{position:absolute;inset:5px;border-radius:14px;border:1px solid #d5d9e0;
+ background:#fff;color:#1d1d1f;font-size:13.5px;line-height:1.5;overflow:hidden}
+.scrn{position:absolute;inset:0;padding:20px 18px;opacity:0;visibility:hidden;
+ transform:scale(.985);transition:opacity .55s ease,transform .55s ease,visibility .55s;overflow:hidden}
+.scrn.on{opacity:1;visibility:visible;transform:none}
+.scrn h3{font-size:17px;margin-bottom:9px;letter-spacing:.01em}
+.scrn .tip{color:#6e7683;font-size:11.5px;margin:5px 0}
+.blk{opacity:0;transform:translateY(10px);transition:opacity .5s ease,transform .5s ease}
+.blk.in{opacity:1;transform:none}
+/* ── 天气（无 emoji） ── */
+.wxhero{background:linear-gradient(160deg,#3d7bd9,#1f4e96);border-radius:16px;color:#fff;padding:14px;margin:0 0 10px;text-align:center}
+.wxbig2{font-size:52px;font-weight:200;line-height:1.05}
+.wxsub{opacity:.92;font-size:12px;margin-top:5px}
+.wxcond{font-size:14px;margin-top:2px;opacity:.95}
+.hstrip{overflow:hidden;margin:4px 0 8px}
+.htrack{display:flex;gap:7px;transition:transform 2.6s cubic-bezier(.45,.05,.25,1)}
+.htrack.sw{transform:translateX(calc(-50% + 44px))}
+.hcard{flex:0 0 72px;background:#eef3fa;border-radius:11px;padding:8px 4px;text-align:center}
+.hcard .lab{font-size:10.5px;color:#5a6b80}
+.hcard .val{font-size:16px;font-weight:700;margin-top:2px}
+.hcard .pp{font-size:10px;color:#2563eb;margin-top:2px}
+.wrow15{display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid #e3e8ef;font-size:12.5px}
+.wrow15 .cond{width:44px;font-size:11px;color:#64748b}
+.wrow15 .dpop{width:34px;font-size:11px;color:#2563eb;text-align:right}
+.wrow15 .dlo,.wrow15 .dhi{width:28px;text-align:center;color:#4a5568}
+.bar15{flex:1;height:6px;border-radius:3px;background:#e3e8ef;position:relative}
+.bar15 span{position:absolute;height:6px;border-radius:3px;background:linear-gradient(90deg,#5aa9e6,#f7b32b);transition:width 1s ease .2s,left 1s ease .2s}
+.wrow15 .bar15 span{width:0;left:20%}
+.wrow15.in .bar15 span{width:var(--bw);left:var(--bl)}
+.aqi{border-radius:12px;padding:10px 13px;color:#fff;display:flex;justify-content:space-between;align-items:center;margin:8px 0}
+.aqibig{font-size:22px;font-weight:700}
+.sunchips{display:flex;gap:7px}
+.sunchips .sc{flex:1;background:#f1f5fb;border-radius:10px;padding:8px;text-align:center;font-size:12px;color:#334155}
+.sunchips .sc b{display:block;font-size:13.5px;color:#1a365d}
+.wxbar{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.refresh{color:#2b6cb0;font-size:12.5px;font-weight:600}
+.refresh.spin{display:inline-block;animation:rspin .8s ease}
+@keyframes rspin{to{transform:rotate(360deg)}}
+/* ── Hold 三机并演：整幕 flex 居中 ── */
+.holdstage{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4.6vh;padding:0 3vw}
+.htop{text-align:center}
+.trio{display:flex;gap:3.2vw;align-items:flex-end}
+.tcell{display:flex;flex-direction:column;align-items:center;gap:13px;opacity:0;transform:translateY(26px);
+ transition:opacity .6s ease var(--td,0s),transform .7s cubic-bezier(.2,.7,.2,1) var(--td,0s)}
+.tcell.in{opacity:1;transform:none}
+.dev3{width:min(292px,18.5vw);aspect-ratio:3/3.94;background:#111114;border-radius:22px;border:8px solid #26262a;
+ box-shadow:0 30px 70px rgba(0,0,0,.6),0 0 0 1.5px rgba(255,255,255,.12);position:relative;overflow:hidden;
+ transition:filter .3s ease}
+.dev3.dead{filter:brightness(.42)}
+.scr3{position:absolute;inset:4px;border-radius:14px;border:1px solid #d5d9e0;background:#fff;color:#1d1d1f;
+ font-size:11.5px;line-height:1.5;overflow:hidden;display:flex;flex-direction:column}
+.scr3.flash{animation:fl 1.1s ease}
+@keyframes fl{0%,100%{box-shadow:none}35%{box-shadow:0 0 0 5px rgba(48,209,88,.5) inset}}
+.p3top{font-size:12.5px;font-weight:700;padding:10px 12px 8px;border-bottom:1px solid #edf0f4;flex:none}
+.body3{flex:1;position:relative;overflow:hidden;padding:0 12px}
+/* 底部恢复芯片槽：固定高度，芯片永不侵入内容区 */
+.chipzone{flex:none;height:44px;position:relative;padding:0 10px}
+.chip3{position:absolute;left:10px;right:10px;top:8px;background:#e7f8ee;color:#1e7d46;border:1px solid #b7e4c7;
+ border-radius:8px;padding:7px 10px;font-size:10.5px;font-weight:600;text-align:center;
+ opacity:0;transform:translateY(10px) scale(.92);transition:opacity .45s ease,transform .5s cubic-bezier(.2,1.4,.4,1)}
+.chip3.in{opacity:1;transform:none}
+.crash{position:absolute;inset:0;background:#0b0d10;opacity:0;transition:opacity .2s ease;z-index:9;
+ display:flex;align-items:center;justify-content:center;color:#3c4450;font-size:10px;letter-spacing:.2em}
+.crash.on{opacity:1}
+/* A：滚动 */
+.scwrap{position:absolute;inset:0;padding-right:14px}
+.sclist{transition:transform 1.8s cubic-bezier(.3,.7,.3,1)}
+.sclist.sw{transform:translateY(-122px)}
+.srow{border-bottom:1px solid #e8ecf1;padding:7px 2px}
+.srow b{font-size:11.5px}
+.srow span{display:block;color:#8a94a3;font-size:9.5px;margin-top:1px}
+.strack{position:absolute;right:4px;top:8px;bottom:8px;width:4px;background:#eef1f5;border-radius:2px}
+.sthumb{position:absolute;left:0;width:4px;height:26%;background:#c6cdd6;border-radius:2px;top:6%;transition:top 1.8s cubic-bezier(.3,.7,.3,1)}
+.strack.sw .sthumb{top:58%}
+/* B：草稿 */
+.ta3{background:#f4f6f8;border:1px solid #dfe3ea;border-radius:8px;padding:9px 11px;min-height:62px;color:#1d1d1f;margin-top:10px}
+.caret{animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.btn3{display:block;background:var(--b2);color:#fff;border-radius:8px;padding:9px;text-align:center;font-size:12px;margin-top:9px}
+.tip3{color:#6e7683;font-size:10px;margin-top:8px}
+/* C：层级（单条 URL 栏 + grid 堆叠页面） */
+.url3{background:#f1f3f6;border-radius:6px;padding:5px 9px;font:9.5px "SF Mono",Menlo,monospace;color:#6e7683;margin-top:10px;white-space:nowrap;overflow:hidden}
+.stageC{position:absolute;top:64px;bottom:6px;left:12px;right:12px}
+.pgC{position:absolute;inset:0;opacity:0;visibility:hidden;transform:translateY(6px);transition:opacity .4s ease,transform .4s ease,visibility .4s}
+.pgC.cur{opacity:1;visibility:visible;transform:none}
+.mcard3{display:block;background:#f4f6f8;border-radius:8px;padding:8px 10px;margin:6px 0;font-size:11.5px;font-weight:600;transition:transform .25s,background .25s}
+.mcard3.tap{background:#dbeafe;transform:scale(.97)}
+.mcard3 small{display:block;font-weight:400;color:#8a94a3;font-size:9.5px;margin-top:1px}
+.pghead{font-size:12px;font-weight:700;margin-top:8px}
+.pgskel{background:#f1f4f8;border-radius:4px;height:9px;margin:7px 0}
+.tlabel{font-size:13px;color:var(--dim);display:flex;align-items:center;gap:8px;letter-spacing:.08em}
+.tlabel i{width:8px;height:8px;border-radius:50%;background:#48484a;transition:background .4s,box-shadow .4s}
+.tlabel.done{color:#c9ced6}
+.tlabel.done i{background:var(--green);box-shadow:0 0 9px rgba(48,209,88,.8)}
+/* ── DIRECT ── */
+.board{width:min(760px,86vw);margin:0 auto;display:flex;flex-direction:column;align-items:center;gap:22px}
+.graph{display:flex;align-items:center;width:100%;min-height:60px}
+.nd{flex:0 0 auto;background:#16181d;border:1px solid #2b3340;border-radius:13px;padding:12px 18px;text-align:center;font-size:14.5px;font-weight:600}
+.nd.relay{border-color:var(--blue);box-shadow:0 0 26px rgba(41,151,255,.3)}
+.link{flex:1;height:2px;margin:0 10px;background:repeating-linear-gradient(90deg,#3b82f6 0 9px,transparent 9px 18px);
+ background-size:18px 2px;animation:flow 1s linear infinite}
+@keyframes flow{to{background-position:18px 0}}
+.chips{position:relative;display:flex;justify-content:center;align-items:center;height:40px}
+.gchip{border-radius:100px;padding:9px 22px;font-size:14px;font-weight:600;transition:opacity .5s ease,transform .5s ease}
+.gchip.a{position:absolute;background:#1c1c21;color:#9a9aa2;border:1px solid #2c2c31}
+.gchip.a.hide{opacity:0;transform:scale(.85)}
+.gchip.b{background:rgba(41,151,255,.16);color:#7cc0ff;border:1px solid rgba(41,151,255,.45);opacity:0;transform:scale(.85)}
+.gchip.b.show{opacity:1;transform:none}
+.term{background:#101318;border:1px solid #26303a;border-radius:14px;padding:15px 20px;text-align:left;
+ font:12.5px/1.95 "SF Mono",Menlo,monospace;color:#c7d2dd;width:100%}
+.term .ok{color:#6ee7a0}.term .dim{color:#5c6b7a}
+/* ── 结尾 ── */
+.wspace{position:relative;height:150px;display:flex;align-items:center;justify-content:center}
+.slogan{font-size:clamp(38px,6vw,80px);font-weight:700;letter-spacing:-.02em;line-height:1.18}
+.slogan .g{background:linear-gradient(92deg,#2997ff,#bf5af2 55%,#64d2ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sendoff{color:var(--dim);font-size:15px;margin-top:24px}
+/* 进度条 / 重播 */
+#bar{position:fixed;left:0;top:0;height:3px;width:0;background:linear-gradient(90deg,#2997ff,#bf5af2);z-index:90}
+#replay{position:fixed;right:18px;bottom:16px;z-index:90;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);
+ color:#d5d7dc;border-radius:100px;padding:8px 18px;font-size:13px;opacity:0;pointer-events:none;transition:.4s}
+#replay.show{opacity:.7;pointer-events:auto}#replay:hover{opacity:1}
+body.clean #replay{display:none}
+</style>
+</head>
+<body>
+<div id="stage">
+<div class="orb o1"></div><div class="orb o2"></div>
+
+<!-- ══ 全局设备（仅天气幕） ══ -->
+<div id="dev" class="p-off"><div id="devInner">
+ <div id="scr">
+  <div class="scrn" id="scr-wx">
+   <h3>Weather</h3>
+   <div class="wxhero">
+    <div style="font-size:14px">金华</div>
+    <div class="wxbig2"><span id="wx-t">0</span>°</div>
+    <div class="wxcond">多云 · 体感 22°</div>
+    <div class="wxsub">最高 25° / 最低 18°</div>
+   </div>
+   <div class="hstrip"><div class="htrack" id="wx-track">
+    <div class="hcard"><div class="lab">14:00</div><div class="val">24°</div><div class="pp">降水 10%</div></div>
+    <div class="hcard"><div class="lab">15:00</div><div class="val">24°</div><div class="pp">降水 15%</div></div>
+    <div class="hcard"><div class="lab">16:00</div><div class="val">23°</div><div class="pp">降水 20%</div></div>
+    <div class="hcard"><div class="lab">17:00</div><div class="val">23°</div><div class="pp">降水 20%</div></div>
+    <div class="hcard"><div class="lab">18:00</div><div class="val">22°</div><div class="pp">降水 25%</div></div>
+    <div class="hcard"><div class="lab">19:00</div><div class="val">21°</div><div class="pp">降水 30%</div></div>
+    <div class="hcard"><div class="lab">20:00</div><div class="val">20°</div><div class="pp">降水 35%</div></div>
+    <div class="hcard"><div class="lab">21:00</div><div class="val">20°</div><div class="pp">降水 30%</div></div>
+   </div></div>
+   <div class="wrow15 blk" id="wx-d1" style="--bl:12%;--bw:52%"><span>明天</span><span class="cond">多云转雨</span><span class="dpop">30%</span><span class="dlo">18°</span><div class="bar15"><span></span></div><span class="dhi">25°</span></div>
+   <div class="wrow15 blk" id="wx-d2" style="--bl:8%;--bw:40%"><span>周五</span><span class="cond">中雨</span><span class="dpop">60%</span><span class="dlo">17°</span><div class="bar15"><span></span></div><span class="dhi">22°</span></div>
+   <div class="aqi blk" id="wx-aqi" style="background:#43a047">
+    <div><div style="font-size:11px;opacity:.9">空气质量 · US AQI</div><div class="aqibig">58 良</div></div>
+    <div style="text-align:right;font-size:11px;line-height:1.7">PM2.5 12.3<br>UV 3.1<br>PM10 24</div>
+   </div>
+   <div class="sunchips blk" id="wx-sun">
+    <div class="sc">日出<b>05:52</b></div>
+    <div class="sc">日落<b>18:34</b></div>
+   </div>
+   <div class="wxbar blk" id="wx-tip">
+    <span class="tip">数据加载于 10 分钟前</span>
+    <span class="refresh" id="wx-refresh">⟳ 刷新</span>
+   </div>
+  </div>
+ </div>
+</div></div>
+
+<!-- ══ 场景 1 · 开场 ══ -->
+<section class="scene" data-scn="intro">
+ <div class="panel mid">
+  <div style="position:relative;display:inline-block">
+   <svg class="wifi" viewBox="0 0 120 90">
+    <path pathLength="100" d="M45.1 56.6 A20 20 0 0 1 74.9 56.6"/>
+    <path pathLength="100" d="M30.3 43.2 A40 40 0 0 1 89.7 43.2"/>
+    <path pathLength="100" d="M15.4 29.9 A60 60 0 0 1 104.6 29.9"/>
+    <circle cx="60" cy="70" r="6.5"/>
+   </svg>
+   <div class="ring" style="width:150px;height:150px;animation-delay:2.9s"></div>
+  </div>
+  <div class="vline" id="vswap">
+   <span>Relay</span>
+   <span class="vslot">
+    <span class="v old">CKG · 2.0</span>
+    <span class="v new">CTU · 3.0</span>
+   </span>
+  </div>
+  <div class="small anim" style="--d:5.2s">Developed by HighspeedG2304</div>
+ </div>
+</section>
+
+<!-- ══ 场景 2 · Relay Hold 三机并演 ══ -->
+<section class="scene" data-scn="hold3">
+ <div class="holdstage">
+  <div class="htop">
+   <div class="h1 anim" style="--d:.2s">更优雅地继续</div>
+   <div class="h2 anim" style="--d:.7s">Relay Hold 架构优化 · 三种记忆，逐一回来</div>
+  </div>
+  <div class="trio">
+   <div class="tcell" id="cellA" style="--td:.35s">
+    <div class="dev3" id="devA"><div class="scr3" id="scrA">
+     <div class="p3top">RemoteClasswork · 班级作业</div>
+     <div class="body3">
+      <div class="scwrap">
+       <div class="sclist" id="sAlist">
+        <div class="srow"><b> 二次函数图像 · 复习要点</b><span>数学 · 昨天 21:40</span></div>
+        <div class="srow"><b> 勾股定理 · 课堂讲义</b><span>数学 · 昨天 20:12</span></div>
+        <div class="srow"><b> Unit 5 Reading A</b><span>英语 · 周一 08:15</span></div>
+        <div class="srow"><b> 物理实验报告模板</b><span>物理 · 周五 17:03</span></div>
+        <div class="srow"><b> 文言文实词整理</b><span>语文 · 周四 19:30</span></div>
+        <div class="srow"><b> 化学方程式配平练习</b><span>化学 · 周三 15:44</span></div>
+        <div class="srow"><b> 地理 · 等高线判读</b><span>地理 · 周三 10:20</span></div>
+        <div class="srow"><b> 历史 · 年表速记</b><span>历史 · 周二 14:05</span></div>
+       </div>
+      </div>
+      <div class="strack" id="sAth"><div class="sthumb"></div></div>
+     </div>
+     <div class="chipzone"><div class="chip3" id="rA">✓ 滚动位置已恢复</div></div>
+     <div class="crash" id="cA">— 进程已退出 —</div>
+    </div></div>
+    <div class="tlabel" id="labA"><i></i>滚动位置</div>
+   </div>
+
+   <div class="tcell" id="cellB" style="--td:.5s">
+    <div class="dev3" id="devB"><div class="scr3" id="scrB">
+     <div class="p3top">Assistant · AI Chat</div>
+     <div class="body3">
+      <div class="ta3"><span id="dB"></span><span class="caret" id="cB">▏</span></div>
+      <div class="btn3">发 送</div>
+      <p class="tip3">输入自动保存草稿</p>
+     </div>
+     <div class="chipzone"><div class="chip3" id="rB">✓ 草稿已恢复</div></div>
+     <div class="crash" id="cB">— 进程已退出 —</div>
+    </div></div>
+    <div class="tlabel" id="labB"><i></i>输入内容</div>
+   </div>
+
+   <div class="tcell" id="cellC" style="--td:.65s">
+    <div class="dev3" id="devC"><div class="scr3" id="scrC">
+     <div class="p3top">Relay</div>
+     <div class="body3">
+      <div class="url3" id="uC">relay.local /home</div>
+      <div class="stageC">
+       <div class="pgC cur" id="pC1">
+        <div class="mcard3" id="tapC">Resource<small>查看图像，文档和演示文稿</small></div>
+        <div class="mcard3">RemoteClasswork<small>查看并编辑班级作业</small></div>
+        <div class="mcard3">Dictionary<small>查询词典</small></div>
+       </div>
+       <div class="pgC" id="pC2">
+        <div class="pghead">勾股定理 · 第 3 / 24 页</div>
+        <div class="pgskel" style="width:78%"></div><div class="pgskel"></div><div class="pgskel" style="width:60%"></div><div class="pgskel"></div><div class="pgskel" style="width:82%"></div>
+       </div>
+      </div>
+     </div>
+     <div class="chipzone"><div class="chip3" id="rC">✓ 直达原页</div></div>
+     <div class="crash" id="cC">— 进程已退出 —</div>
+    </div></div>
+    <div class="tlabel" id="labC"><i></i>页面层级</div>
+   </div>
+  </div>
+ </div>
+</section>
+
+<!-- ══ 场景 3 · 全新天气 ══ -->
+<section class="scene" data-scn="wx">
+ <div class="panel side-r">
+  <div class="h1 anim" style="--d:.3s">天气，焕然一新</div>
+  <div class="h2 anim" style="--d:.8s">Open-Meteo 数据源<br>逐小时预报 · 多天预报 · 空气质量 · 日出日落。</div>
+  <div class="small anim" style="--d:4.6s">横向轻扫，数据随手可得；<br>数据缓存机制，避免并发阻塞</div>
+ </div>
+</section>
+
+<!-- ══ 场景 4 · DIRECT 扩容与自愈 ══ -->
+<section class="scene" data-scn="direct">
+ <div class="panel mid" style="width:min(860px,88vw)">
+  <div class="h1 anim">一个都不能少</div>
+  <div class="h2 anim" style="--d:.4s">Wi-Fi 热点扩容；GO 检测 + DNS 复检，15 分钟自动巡航</div>
+  <div class="board">
+   <div class="graph anim" style="--d:.8s">
+    <div class="nd">Relay 主机</div>
+    <div class="link"></div>
+    <div class="nd relay">DIRECT GO 热点</div>
+    <div class="link"></div>
+    <div class="nd">平板 × 64</div>
+   </div>
+   <div class="chips anim" style="--d:1.3s">
+    <span class="gchip a" id="dg-a">Hosted Network · 10 台</span>
+    <span class="gchip b" id="dg-b">+ DIRECT WLAN · 64 台</span>
+   </div>
+   <div class="term anim" style="--d:2.2s">
+    <div class="blk" id="t1"><span class="dim">$</span> relay --selfheal DIRECT</div>
+    <div class="blk" id="t2">DNS 重设 .............. <span class="ok">ok</span></div>
+    <div class="blk" id="t3">热点重启（RPC 7378）... <span class="ok">True → True</span></div>
+    <div class="blk" id="t4">GO 接口 ............... 192.168.137.1</div>
+    <div class="blk" id="t5">DNS 复检 .............. <span class="ok">hijack-ok</span></div>
+    <div class="blk" id="t6"><span class="dim">watchdog · 每 15 分钟</span></div>
+   </div>
+  </div>
+ </div>
+</section>
+
+<!-- ══ 场景 5 · 结尾 ══ -->
+<section class="scene" data-scn="end">
+ <div class="panel mid">
+  <div class="wspace">
+   <div class="ring" style="width:170px;height:170px;animation-delay:1.5s"></div>
+   <div class="ring" style="width:170px;height:170px;animation-delay:2.3s"></div>
+   <svg class="wifi" viewBox="0 0 120 90" style="width:150px">
+    <path pathLength="100" d="M45.1 56.6 A20 20 0 0 1 74.9 56.6"/>
+    <path pathLength="100" d="M30.3 43.2 A40 40 0 0 1 89.7 43.2"/>
+    <path pathLength="100" d="M15.4 29.9 A60 60 0 0 1 104.6 29.9"/>
+    <circle cx="60" cy="70" r="6.5"/>
+   </svg>
+  </div>
+  <div class="slogan anim" style="--d:2.9s">Relink WLAN.</div>
+  <div class="slogan anim" style="--d:3.9s"><span class="g">Relay WISH.</span></div>
+  <div class="sendoff anim" style="--d:6.2s">Relay 3.0 · CTU · Developer HighspeedG2304</div>
+ </div>
+</section>
+</div>
+
+<div id="bar"></div>
+<button id="replay" onclick="start()">↺ 重播</button>
+
+<script>
+const $=s=>document.querySelector(s);
+const scenes=[...document.querySelectorAll('.scene')];
+const dur=[7,12,10,9,10].map(x=>x*1000);
+const TOTAL=dur.reduce((a,b)=>a+b,0);
+let C=[];
+function later(ms,fn){const id=setTimeout(fn,ms);C.push(()=>clearTimeout(id));}
+function wipe(){C.forEach(f=>f());C=[];}
+function showScr(id){document.querySelectorAll('.scrn').forEach(s=>s.classList.remove('on'));
+ if(id)$(id).classList.add('on');}
+function setPos(pos){
+ const dev=$('#dev');
+ if(pos==='p-off'){
+  const cs=getComputedStyle(dev);
+  ['--dx','--dy','--s','--r'].forEach(v=>{
+   const val=(cs.getPropertyValue(v)||'').trim();
+   if(val)dev.style.setProperty('--off'+v.slice(3),val);
+  });
+  dev.className='p-off';
+ }else dev.className=pos;
+}
+function typeInto(el,text,speed,onDone){
+ let k=0;const id=setInterval(()=>{k++;el.textContent=text.slice(0,k);
+  if(k>=text.length){clearInterval(id);if(onDone)onDone();}},speed);
+ C.push(()=>clearInterval(id));
+}
+
+const DEV={intro:'p-off',hold3:'p-off',wx:'p-l1',direct:'p-off',end:'p-off'};
+
+const hooks={
+ intro(){
+  $('#vswap').classList.remove('swap');
+  later(2950,()=>$('#vswap').classList.add('swap'));
+ },
+ hold3(){
+  /* 复位 */
+  ['cellA','cellB','cellC'].forEach(id=>$(('#'+id)).classList.remove('in'));
+  $('#sAlist').classList.remove('sw');$('#sAth').classList.remove('sw');
+  const dB=$('#dB');dB.textContent='';$('#cB').style.display='inline';
+  $('#uC').textContent='relay.local /home';
+  $('#pC1').classList.add('cur');$('#pC2').classList.remove('cur');
+  $('#tapC').classList.remove('tap');
+  ['devA','devB','devC'].forEach(id=>$(('#'+id)).classList.remove('dead'));
+  ['cA','cB','cC'].forEach(id=>$(('#'+id)).classList.remove('on'));
+  ['rA','rB','rC'].forEach(id=>$(('#'+id)).classList.remove('in'));
+  ['labA','labB','labC'].forEach(id=>$(('#'+id)).classList.remove('done'));
+  ['scrA','scrB','scrC'].forEach(id=>$(('#'+id)).classList.remove('flash'));
+  /* 入场 */
+  later(150,()=>$('#cellA').classList.add('in'));
+  later(320,()=>$('#cellB').classList.add('in'));
+  later(490,()=>$('#cellC').classList.add('in'));
+  /* A：真实滚动 */
+  later(1100,()=>{$('#sAlist').classList.add('sw');$('#sAth').classList.add('sw');});
+  /* B：逐字输入 */
+  later(1000,()=>typeInto(dB,'判断 x² − 5x + 6 = 0 两根的符号',88));
+  /* C：进入深层页（URL 栏同步切换） */
+  later(1300,()=>$('#tapC').classList.add('tap'));
+  later(1950,()=>{$('#tapC').classList.remove('tap');$('#pC1').classList.remove('cur');
+   $('#pC2').classList.add('cur');$('#uC').textContent='relay.local /resource/view/a1f9?page=3';});
+  /* 三机同时闪退 */
+  later(3900,()=>{['cA','cB','cC'].forEach(id=>$(('#'+id)).classList.add('on'));
+   ['devA','devB','devC'].forEach(id=>$(('#'+id)).classList.add('dead'));});
+  /* 重开：状态原样保留 */
+  later(5200,()=>{['cA','cB','cC'].forEach(id=>$(('#'+id)).classList.remove('on'));
+   ['devA','devB','devC'].forEach(id=>$(('#'+id)).classList.remove('dead'));
+   $('#cB').style.display='none';});
+  later(5600,()=>{$('#rA').classList.add('in');$('#scrA').classList.add('flash');});
+  later(5900,()=>{$('#rB').classList.add('in');$('#scrB').classList.add('flash');});
+  later(6200,()=>{$('#rC').classList.add('in');$('#scrC').classList.add('flash');});
+  later(7100,()=>{['labA','labB','labC'].forEach(id=>$(('#'+id)).classList.add('done'));});
+ },
+ wx(){
+  showScr('#scr-wx');
+  ['wx-d1','wx-d2','wx-aqi','wx-sun','wx-tip'].forEach(id=>$('#'+id).classList.remove('in'));
+  const tr=$('#wx-track');tr.classList.remove('sw');
+  const rf=$('#wx-refresh');rf.classList.remove('spin');
+  const el=$('#wx-t');let v=0;el.textContent='0';
+  later(1200,()=>{const id=setInterval(()=>{v++;el.textContent=v;if(v>=23)clearInterval(id);},40);C.push(()=>clearInterval(id));});
+  later(4300,()=>tr.classList.add('sw'));
+  later(5400,()=>$('#wx-d1').classList.add('in'));
+  later(5700,()=>$('#wx-d2').classList.add('in'));
+  later(6500,()=>$('#wx-aqi').classList.add('in'));
+  later(7100,()=>$('#wx-sun').classList.add('in'));
+  later(7800,()=>{rf.classList.add('spin');$('#wx-tip').classList.add('in');});
+ },
+ direct(){
+  const a=$('#dg-a'),b=$('#dg-b');
+  a.classList.remove('hide');b.classList.remove('show');
+  ['t1','t2','t3','t4','t5','t6'].forEach(id=>$('#'+id).classList.remove('in'));
+  later(2400,()=>{a.classList.add('hide');b.classList.add('show');});
+  [3400,3850,4300,4750,5200,5650].forEach((t,i)=>later(t,()=>$('#t'+(i+1)).classList.add('in')));
+ },
+ end(){}
+};
+
+let i=-1,t0=0;
+const bar=$('#bar');
+function tick(){ if(!t0)return; const p=Math.min(1,(performance.now()-t0)/TOTAL);
+ bar.style.width=(p*100)+'%'; if(p<1)requestAnimationFrame(tick); }
+function step(){ wipe(); i++;
+ if(i>=scenes.length){ $('#replay').classList.add('show'); return; }
+ scenes.forEach((s,k)=>s.classList.toggle('on',k===i));
+ setPos(DEV[scenes[i].dataset.scn]);
+ const h=hooks[scenes[i].dataset.scn]; if(h)h();
+ setTimeout(step,dur[i]);
+}
+function start(){ i=-1; $('#replay').classList.remove('show');
+ t0=performance.now(); requestAnimationFrame(tick); step(); }
+if(location.hash.indexOf('clean')>-1)document.body.classList.add('clean');
+window.addEventListener('load',start);
+</script>
+</body>
+</html>
